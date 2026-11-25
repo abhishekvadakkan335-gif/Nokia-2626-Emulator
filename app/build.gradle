@@ -1,0 +1,4 @@
+plugins { id 'com.android.application' }
+android { namespace 'com.retro.n2626'; compileSdk 35
+ defaultConfig { applicationId 'com.retro.n2626'; minSdk 23; targetSdk 34; versionCode 1; versionName '0.1' }
+}
