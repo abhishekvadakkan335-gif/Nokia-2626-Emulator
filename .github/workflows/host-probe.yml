@@ -1,0 +1,40 @@
+name: Host Firmware Probe
+on:
+  push:
+    paths:
+      - 'app/src/main/cpp/**'
+      - 'tools/host/**'
+      - '.github/workflows/host-probe.yml'
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install matching host Unicorn
+        run: python -m pip install --only-binary=:all: unicorn==2.1.4
+      - name: Build host JNI library and runner
+        run: |
+          set -eu
+          mkdir -p host-out/classes
+          UCLIB=$(python -c 'import pathlib, unicorn; print(pathlib.Path(unicorn.__file__).parent / "lib")')
+          ls -l "$UCLIB"
+          cp -L "$UCLIB/libunicorn.so.2" host-out/libunicorn.so.2
+          gcc -std=c11 -O2 -fPIC -shared -Wall -Wextra \
+            -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+            -Iapp/src/main/cpp/include app/src/main/cpp/native_bridge.c \
+            -Lhost-out -Wl,-rpath,'$ORIGIN' -l:libunicorn.so.2 \
+            -o host-out/libnokia_engine.so
+          javac -d host-out/classes tools/host/NativeEngine.java
+          java -Djava.library.path=host-out -cp host-out/classes com.retro.n2626.NativeEngine --self-test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Nokia2626-host-probe
+          path: host-out/
