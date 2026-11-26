@@ -134,9 +134,10 @@ typedef struct {
     bool ext_mapped;
     uint64_t ram_min,ram_max,ram_last_pc;
     bool ram_mapped;
-    bool reg9000_valid,read_limit;
+    bool reg9000_valid,reg10002_valid,read_limit;
+    unsigned reg10002_reads;
     bool d00e_seen,d010_seen,reg10000_seen;
-    uint16_t reg9000;
+    uint16_t reg9000,reg10002;
     uint64_t pc[24],recent_pc[TRACE_KEEP],fault,last,fault_value;
     uint32_t recent_size[TRACE_KEEP];
     uint32_t size[24];
@@ -156,6 +157,15 @@ static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *d
     fw_trace *t=data;
     if(!t->faulted && offset==0x9000 && size==2 && t->reg9000_valid && t->reads<MAX_MMIO_READS){
         uint16_t value=t->reg9000;
+        fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,value,t->last,size});
+        return value;
+    }
+    /* Observed read-modify-write of 0x06010002. Preserve raw callback
+     * byte order, as with the existing 0x06009000 experiment.
+     * Readback is a hypothesis; no physical register side effects modeled. */
+    if(!t->faulted && offset==0x10002 && size==2 && t->reg10002_valid && t->reads<MAX_MMIO_READS){
+        uint16_t value=t->reg10002;
+        t->reg10002_reads++;
         fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,value,t->last,size});
         return value;
     }
@@ -191,6 +201,8 @@ static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t v
         fw_record(t->first_writes,t->last_writes,&t->writes,(fw_write){PROBE_MMIO+offset,value,t->last,size});
         if(offset==0x9000&&size==2){t->reg9000=(uint16_t)value;t->reg9000_valid=true;}
         else if(offset<0x9002 && offset+size>0x9000)t->reg9000_valid=false;
+        if(offset==0x10002&&size==2){t->reg10002=(uint16_t)value;t->reg10002_valid=true;}
+        else if(offset<0x10004 && offset+size>0x10002)t->reg10002_valid=false;
         return; /* all other writes are logged only */
     }
     t->faulted=true;t->unsupported_mmio=true;t->write_limit=t->writes>=MAX_MMIO_WRITES;
@@ -314,6 +326,7 @@ done:;
         fw_write *w=i<TRACE_KEEP?&t.first_writes[i]:&t.last_writes[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",w->addr,w->value,w->pc,w->width);
     }
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\n0x06010002 readback: %u reads | last raw write: 0x%04x | valid: %s\n",t.reg10002_reads,(unsigned)t.reg10002,t.reg10002_valid?"yes":"no");
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nSpeculative D000 zero reads: D00E=%s | D010=%s\n",t.d00e_seen?"used":"not used",t.d010_seen?"used":"not used");
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nExperimental reads: %u / %u\nAddress | Raw MMIO return value | Guest PC | Bytes\n",t.reads,MAX_MMIO_READS);
     for(unsigned i=0;i<t.reads&&used<sizeof(msg);i++){
@@ -346,6 +359,6 @@ done:;
             }
         }
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 supports speculative 16-bit readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. One one-shot read at 0x06010000 / PC 0x0109BD5A also returns hypothetical zero. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 and 0x06010002 support speculative 16-bit last-write readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. One one-shot read at 0x06010000 / PC 0x0109BD5A also returns hypothetical zero. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
