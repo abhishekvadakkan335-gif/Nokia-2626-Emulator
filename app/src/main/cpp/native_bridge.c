@@ -103,6 +103,10 @@ finish:
 
 #define FW_BASE 0x01000000u
 #define FW_ENTRY 0x01000100u
+/* Hypothetical low RAM window containing the observed stack and write. */
+#define FW_RAM_BASE 0x00010000u
+#define FW_RAM_SIZE 0x00010000u
+#define FW_MAX_INSNS 200000u
 /* Exploratory MMIO region. Only the observed register at 0x06009000
  * can return its last written halfword. This is a hypothesis, not hardware fidelity. */
 #define PROBE_MMIO 0x06000000u
@@ -112,6 +116,9 @@ finish:
 typedef struct {uint64_t addr,value,pc; unsigned width;} fw_write;
 typedef struct {
     unsigned count,writes,reads;
+    unsigned ram_reads,ram_writes;
+    uint64_t ram_min,ram_max,ram_last_pc;
+    bool ram_mapped;
     bool reg9000_valid,read_limit;
     uint16_t reg9000;
     uint64_t pc[24],fault,last,fault_value;
@@ -151,6 +158,16 @@ static void fw_code(uc_engine *uc,uint64_t address,uint32_t size,void *data){
     if(t->count<24){t->pc[t->count]=address;t->size[t->count]=size;}
     t->count++;t->last=address;
 }
+static void fw_ram_access(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
+    (void)uc;(void)value;fw_trace *t=data;
+    if(t->faulted||size<=0)return;
+    if(t->ram_reads==0&&t->ram_writes==0){t->ram_min=address;t->ram_max=address+(uint64_t)size-1;}
+    if(address<t->ram_min)t->ram_min=address;
+    if(address+(uint64_t)size-1>t->ram_max)t->ram_max=address+(uint64_t)size-1;
+    if(type==UC_MEM_READ)t->ram_reads++;
+    if(type==UC_MEM_WRITE)t->ram_writes++;
+    t->ram_last_pc=t->last;
+}
 static bool fw_invalid(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
     (void)uc;fw_trace *t=data;
     if(!t->faulted){t->faulted=true;t->fault=address;t->type=type;t->width=size;t->fault_value=(uint64_t)value;}
@@ -160,7 +177,7 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     (void)cls;
     if(!input||(*env)->GetArrayLength(env,input)!=0x896f84)return (*env)->NewStringUTF(env,"Unexpected flash image size.");
     const size_t length=0x896f84,mapped=(length+4095)&~(size_t)4095;
-    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2;fw_trace t={0};
+    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3;fw_trace t={0};
     uint32_t pc=0,cpsr=0,sp=0;char msg[10000];const char *stage="open";
     err=uc_open(UC_ARCH_ARM,UC_MODE_ARM|UC_MODE_BIG_ENDIAN,&uc);if(err)goto done;
     stage="select experimental ARMv4T model";err=uc_ctl_set_cpu_model(uc,UC_CPU_ARM_TI925T);if(err)goto done;
@@ -170,15 +187,22 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     stage="copy flash";err=uc_mem_write(uc,FW_BASE,bytes,length);
     (*env)->ReleaseByteArrayElements(env,input,bytes,JNI_ABORT);if(err)goto done;
     stage="protect flash";err=uc_mem_protect(uc,FW_BASE,mapped,UC_PROT_READ|UC_PROT_EXEC);if(err)goto done;
+    stage="map provisional low RAM";
+    err=uc_mem_map(uc,FW_RAM_BASE,FW_RAM_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
+    t.ram_mapped=true;
     stage="map experimental MMIO readback";err=uc_mmio_map(uc,PROBE_MMIO,PROBE_MMIO_SIZE,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
     stage="initialize CPSR";err=uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     cpsr=(cpsr&~0x3fu)|0xd3u;err=uc_reg_write(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     stage="install hooks";err=uc_hook_add(uc,&h1,UC_HOOK_CODE,(void*)fw_code,&t,1,0);if(err)goto done;
     err=uc_hook_add(uc,&h2,UC_HOOK_MEM_INVALID,(void*)fw_invalid,&t,1,0);if(err)goto done;
-    stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,1000000,2048);
+    err=uc_hook_add(uc,&h3,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_ram_access,&t,FW_RAM_BASE,FW_RAM_BASE+FW_RAM_SIZE-1);if(err)goto done;
+    stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,2000000,FW_MAX_INSNS);
     uc_reg_read(uc,UC_ARM_REG_PC,&pc);uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);uc_reg_read(uc,UC_ARM_REG_SP,&sp);
 done:;
     size_t used=(size_t)snprintf(msg,sizeof(msg),"RM-291 startup probe\nEntry: 0x%08x\nExperimental big-endian ARMv4T\nInstruction callbacks: %u (includes faulting instruction)\nStage: %s\nEngine: %s\nPC: 0x%08x\nCPSR: 0x%08x\nSP: 0x%08x\n",FW_ENTRY,t.count,stage,uc_strerror(err),pc,cpsr,sp);
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Provisional RAM: %s\nWindow: 0x00010000-0x0001FFFF (64 KiB, initially zero)\nRAM reads: %u | RAM writes: %u\n",t.ram_mapped?"mapped":"not mapped",t.ram_reads,t.ram_writes);
+    if((t.ram_reads||t.ram_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"RAM touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast RAM access PC: 0x%08" PRIx64 "\n",t.ram_min,t.ram_max,t.ram_last_pc);
+    if(!t.faulted&&err==UC_ERR_OK&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"No recorded fault; probe ended (instruction/time limit or end address). Not proof of boot.\n");
     if(t.faulted&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped access: 0x%08" PRIx64 "\nType: %d, size: %d\n",t.fault,t.type,t.width);
     if(t.faulted&&(t.type==UC_MEM_WRITE||t.type==UC_MEM_WRITE_UNMAPPED||t.type==UC_MEM_WRITE_PROT)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Attempted write value: 0x%" PRIx64 "\n",t.fault_value);
     if(t.unsupported_mmio&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped: %s. Engine OK does not imply boot success.\n",t.write_limit?"exploratory write limit":t.read_limit?"exploratory read limit":"unsupported MMIO");
@@ -192,6 +216,6 @@ done:;
         fw_write *r=&t.read_log[i];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nOnly 0x06009000 supports speculative 16-bit readback. Other reads stop. No RAM or verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nOnly 0x06009000 supports speculative 16-bit readback. Other reads stop. RAM window and MMIO readback are experimental; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
