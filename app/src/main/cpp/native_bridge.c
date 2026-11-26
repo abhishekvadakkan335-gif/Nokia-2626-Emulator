@@ -103,32 +103,43 @@ finish:
 
 #define FW_BASE 0x01000000u
 #define FW_ENTRY 0x01000100u
-/* Exploratory write-only region encompassing the two observed addresses.
- * No register side effects, readback, RAM or actual device behavior inferred. */
+/* Exploratory MMIO region. Only the observed register at 0x06009000
+ * can return its last written halfword. This is a hypothesis, not hardware fidelity. */
 #define PROBE_MMIO 0x06000000u
 #define PROBE_MMIO_SIZE 0x20000u
 #define MAX_MMIO_WRITES 32u
+#define MAX_MMIO_READS 32u
 typedef struct {uint64_t addr,value,pc; unsigned width;} fw_write;
 typedef struct {
-    unsigned count,writes;
+    unsigned count,writes,reads;
+    bool reg9000_valid,read_limit;
+    uint16_t reg9000;
     uint64_t pc[24],fault,last,fault_value;
     uint32_t size[24];
     int type,width;
     bool faulted,unsupported_mmio,write_limit;
-    fw_write log[MAX_MMIO_WRITES];
+    fw_write log[MAX_MMIO_WRITES],read_log[MAX_MMIO_READS];
 } fw_trace;
 static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *data){
     fw_trace *t=data;
+    if(!t->faulted && offset==0x9000 && size==2 && t->reg9000_valid && t->reads<MAX_MMIO_READS){
+        uint16_t value=t->reg9000;
+        t->read_log[t->reads++]=(fw_write){PROBE_MMIO+offset,value,t->last,size};
+        return value;
+    }
     t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
     t->type=UC_MEM_READ;t->width=(int)size;
+    t->read_limit=t->reads>=MAX_MMIO_READS;
     uc_emu_stop(uc);
-    return 0; /* required callback result; execution must not continue past this read */
+    return 0; /* required placeholder; trace stops on unsupported reads */
 }
 static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t value,void *data){
     fw_trace *t=data;
     if(!t->faulted && t->writes<MAX_MMIO_WRITES && (size==1||size==2||size==4) && offset+size<=PROBE_MMIO_SIZE){
         t->log[t->writes++]=(fw_write){PROBE_MMIO+offset,value,t->last,size};
-        return; /* write sink only, no physical or modeled side effects */
+        if(offset==0x9000&&size==2){t->reg9000=(uint16_t)value;t->reg9000_valid=true;}
+        else if(offset<0x9002 && offset+size>0x9000)t->reg9000_valid=false;
+        return; /* all other writes are logged only */
     }
     t->faulted=true;t->unsupported_mmio=true;t->write_limit=t->writes>=MAX_MMIO_WRITES;
     t->fault=PROBE_MMIO+offset;t->fault_value=value;t->type=UC_MEM_WRITE;t->width=(int)size;
@@ -150,7 +161,7 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     if(!input||(*env)->GetArrayLength(env,input)!=0x896f84)return (*env)->NewStringUTF(env,"Unexpected flash image size.");
     const size_t length=0x896f84,mapped=(length+4095)&~(size_t)4095;
     uc_engine *uc=NULL;uc_err err;uc_hook h1,h2;fw_trace t={0};
-    uint32_t pc=0,cpsr=0,sp=0;char msg[6000];const char *stage="open";
+    uint32_t pc=0,cpsr=0,sp=0;char msg[10000];const char *stage="open";
     err=uc_open(UC_ARCH_ARM,UC_MODE_ARM|UC_MODE_BIG_ENDIAN,&uc);if(err)goto done;
     stage="select experimental ARMv4T model";err=uc_ctl_set_cpu_model(uc,UC_CPU_ARM_TI925T);if(err)goto done;
     stage="map flash";err=uc_mem_map(uc,FW_BASE,mapped,UC_PROT_ALL);if(err)goto done;
@@ -159,7 +170,7 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     stage="copy flash";err=uc_mem_write(uc,FW_BASE,bytes,length);
     (*env)->ReleaseByteArrayElements(env,input,bytes,JNI_ABORT);if(err)goto done;
     stage="protect flash";err=uc_mem_protect(uc,FW_BASE,mapped,UC_PROT_READ|UC_PROT_EXEC);if(err)goto done;
-    stage="map experimental MMIO write sink";err=uc_mmio_map(uc,PROBE_MMIO,PROBE_MMIO_SIZE,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
+    stage="map experimental MMIO readback";err=uc_mmio_map(uc,PROBE_MMIO,PROBE_MMIO_SIZE,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
     stage="initialize CPSR";err=uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     cpsr=(cpsr&~0x3fu)|0xd3u;err=uc_reg_write(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     stage="install hooks";err=uc_hook_add(uc,&h1,UC_HOOK_CODE,(void*)fw_code,&t,1,0);if(err)goto done;
@@ -170,12 +181,17 @@ done:;
     size_t used=(size_t)snprintf(msg,sizeof(msg),"RM-291 startup probe\nEntry: 0x%08x\nExperimental big-endian ARMv4T\nInstruction callbacks: %u (includes faulting instruction)\nStage: %s\nEngine: %s\nPC: 0x%08x\nCPSR: 0x%08x\nSP: 0x%08x\n",FW_ENTRY,t.count,stage,uc_strerror(err),pc,cpsr,sp);
     if(t.faulted&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped access: 0x%08" PRIx64 "\nType: %d, size: %d\n",t.fault,t.type,t.width);
     if(t.faulted&&(t.type==UC_MEM_WRITE||t.type==UC_MEM_WRITE_UNMAPPED||t.type==UC_MEM_WRITE_PROT)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Attempted write value: 0x%" PRIx64 "\n",t.fault_value);
-    if(t.unsupported_mmio&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped: %s. Engine OK does not imply boot success.\n",t.write_limit?"exploratory write limit":"unsupported MMIO");
+    if(t.unsupported_mmio&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped: %s. Engine OK does not imply boot success.\n",t.write_limit?"exploratory write limit":t.read_limit?"exploratory read limit":"unsupported MMIO");
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Last callback PC: 0x%08" PRIx64 "\n\nExploratory writes: %u / %u\nAddress | Value | Guest PC | Bytes\n",t.last,t.writes,MAX_MMIO_WRITES);
     for(unsigned i=0;i<t.writes&&used<sizeof(msg);i++){
         fw_write *w=&t.log[i];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",w->addr,w->value,w->pc,w->width);
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe region: 0x06000000-0x0601FFFF. Write-only logging, no verified side effects. No RAM or verified peripherals. Not a completed OS boot.");
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nExperimental reads: %u / %u\nAddress | Returned value | Guest PC | Bytes\n",t.reads,MAX_MMIO_READS);
+    for(unsigned i=0;i<t.reads&&used<sizeof(msg);i++){
+        fw_write *r=&t.read_log[i];
+        used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
+    }
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nOnly 0x06009000 supports speculative 16-bit readback. Other reads stop. No RAM or verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
