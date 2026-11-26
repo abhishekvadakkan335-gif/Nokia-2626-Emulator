@@ -109,6 +109,9 @@ finish:
 /* Observed memory-copy destination at 0x20; do not assume contiguous RAM. */
 #define FW_ZERO_BASE 0x00000000u
 #define FW_ZERO_SIZE 0x00001000u
+/* Provisional separate stack window: observed SP 0x000ddf94 and PUSH at 0x000ddf8c. */
+#define FW_STACK_BASE 0x000d0000u
+#define FW_STACK_SIZE 0x00010000u
 /* Capacity from schematic; base inferred from observed two-halfword RAM test. */
 #define FW_EXT_RAM_BASE 0x03000000u
 #define FW_EXT_RAM_SIZE 0x00200000u
@@ -128,6 +131,10 @@ typedef struct {
     unsigned count,writes,reads;
     unsigned ram_reads,ram_writes,ext_reads,ext_writes;
     unsigned zero_reads,zero_writes;
+    unsigned stack_reads,stack_writes,stack_switches;
+    uint64_t stack_min,stack_max,stack_last_pc;
+    uint32_t stack_targets[TRACE_KEEP];
+    bool stack_mapped;
     uint64_t zero_min,zero_max,zero_last_pc;
     bool zero_mapped;
     uint64_t ext_min,ext_max,ext_last_pc;
@@ -230,6 +237,15 @@ static void fw_code(uc_engine *uc,uint64_t address,uint32_t size,void *data){
     fw_trace *t=data;
     if(t->faulted){uc_emu_stop(uc);return;}
     if(t->count<24){t->pc[t->count]=address;t->size[t->count]=size;}
+    /* At the observed Thumb MOV SP,R0 instruction, record requested stack
+     * addresses without changing guest state or assuming their validity. */
+    if(address==0x010b9f8c && size==2){
+        uint32_t target=0;
+        if(uc_reg_read(uc,UC_ARM_REG_R0,&target)==UC_ERR_OK){
+            t->stack_targets[t->stack_switches%TRACE_KEEP]=target;
+            t->stack_switches++;
+        }
+    }
     t->recent_pc[t->count%TRACE_KEEP]=address;
     t->recent_size[t->count%TRACE_KEEP]=size;
     t->count++;t->last=address;
@@ -264,6 +280,16 @@ static void fw_zero_access(uc_engine *uc,uc_mem_type type,uint64_t address,int s
     if(type==UC_MEM_WRITE)t->zero_writes++;
     t->zero_last_pc=t->last;
 }
+static void fw_stack_access(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
+    (void)uc;(void)value;fw_trace *t=data;
+    if(t->faulted||size<=0)return;
+    if(t->stack_reads==0&&t->stack_writes==0){t->stack_min=address;t->stack_max=address+(uint64_t)size-1;}
+    if(address<t->stack_min)t->stack_min=address;
+    if(address+(uint64_t)size-1>t->stack_max)t->stack_max=address+(uint64_t)size-1;
+    if(type==UC_MEM_READ)t->stack_reads++;
+    if(type==UC_MEM_WRITE)t->stack_writes++;
+    t->stack_last_pc=t->last;
+}
 static bool fw_invalid(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
     (void)uc;fw_trace *t=data;
     if(!t->faulted){t->faulted=true;t->fault=address;t->type=type;t->width=size;t->fault_value=(uint64_t)value;}
@@ -273,7 +299,7 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     (void)cls;
     if(!input||(*env)->GetArrayLength(env,input)!=0x896f84)return (*env)->NewStringUTF(env,"Unexpected flash image size.");
     const size_t length=0x896f84,mapped=(length+4095)&~(size_t)4095;
-    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3,h4,h5;fw_trace t={0};
+    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3,h4,h5,h6;fw_trace t={0};
     uint32_t pc=0,cpsr=0,sp=0,r0=0,r1=0,r2=0,lr=0;char msg[10000];const char *stage="open";
     err=uc_open(UC_ARCH_ARM,UC_MODE_ARM|UC_MODE_BIG_ENDIAN,&uc);if(err)goto done;
     stage="select experimental ARMv4T model";err=uc_ctl_set_cpu_model(uc,UC_CPU_ARM_TI925T);if(err)goto done;
@@ -288,6 +314,8 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     t.ram_mapped=true;
     stage="map provisional zero page";err=uc_mem_map(uc,FW_ZERO_BASE,FW_ZERO_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
     t.zero_mapped=true;
+    stage="map provisional stack RAM";err=uc_mem_map(uc,FW_STACK_BASE,FW_STACK_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
+    t.stack_mapped=true;
     stage="map provisional external RAM";err=uc_mem_map(uc,FW_EXT_RAM_BASE,FW_EXT_RAM_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
     t.ext_mapped=true;
     stage="map experimental MMIO readback";err=uc_mmio_map(uc,PROBE_MMIO,PROBE_MMIO_SIZE,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
@@ -300,6 +328,7 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     err=uc_hook_add(uc,&h3,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_ram_access,&t,FW_RAM_BASE,FW_RAM_BASE+FW_RAM_SIZE-1);if(err)goto done;
     err=uc_hook_add(uc,&h4,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_ext_ram_access,&t,FW_EXT_RAM_BASE,FW_EXT_RAM_BASE+FW_EXT_RAM_SIZE-1);if(err)goto done;
     err=uc_hook_add(uc,&h5,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_zero_access,&t,FW_ZERO_BASE,FW_ZERO_BASE+FW_ZERO_SIZE-1);if(err)goto done;
+    err=uc_hook_add(uc,&h6,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_stack_access,&t,FW_STACK_BASE,FW_STACK_BASE+FW_STACK_SIZE-1);if(err)goto done;
     stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,2000000,FW_MAX_INSNS);
     uc_reg_read(uc,UC_ARM_REG_PC,&pc);uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);uc_reg_read(uc,UC_ARM_REG_SP,&sp);
     uc_reg_read(uc,UC_ARM_REG_R0,&r0);uc_reg_read(uc,UC_ARM_REG_R1,&r1);uc_reg_read(uc,UC_ARM_REG_R2,&r2);uc_reg_read(uc,UC_ARM_REG_LR,&lr);
@@ -311,6 +340,12 @@ done:;
     if((t.ext_reads||t.ext_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"External RAM touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast external RAM PC: 0x%08" PRIx64 "\n",t.ext_min,t.ext_max,t.ext_last_pc);
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Zero page: %s (provisional 4 KiB, read/write only)\nZero page reads: %u | writes: %u\n",t.zero_mapped?"mapped":"not mapped",t.zero_reads,t.zero_writes);
     if((t.zero_reads||t.zero_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Zero page touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast zero page PC: 0x%08" PRIx64 "\n",t.zero_min,t.zero_max,t.zero_last_pc);
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stack RAM: %s (provisional 64 KiB, RW)\nWindow: 0x000D0000-0x000DFFFF\nStack RAM reads: %u | writes: %u\n",t.stack_mapped?"mapped":"not mapped",t.stack_reads,t.stack_writes);
+    if((t.stack_reads||t.stack_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stack RAM touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast stack RAM PC: 0x%08" PRIx64 "\n",t.stack_min,t.stack_max,t.stack_last_pc);
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stack switch requests at PC 0x010B9F8C: %u\n",t.stack_switches);
+    for(unsigned i=t.stack_switches>TRACE_KEEP?t.stack_switches-TRACE_KEEP:0;i<t.stack_switches&&used<sizeof(msg);i++){
+        used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"SP target %u: 0x%08x\n",i+1,t.stack_targets[i%TRACE_KEEP]);
+    }
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"R0: 0x%08x | R1: 0x%08x\nR2: 0x%08x | LR: 0x%08x\n",r0,r1,r2,lr);
     if(!t.faulted&&err==UC_ERR_OK&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"No recorded fault; probe ended (instruction/time limit or end address). Not proof of boot.\n");
     if(t.faulted&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped access: 0x%08" PRIx64 "\nType: %d, size: %d\n",t.fault,t.type,t.width);
