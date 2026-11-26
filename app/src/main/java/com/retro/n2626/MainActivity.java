@@ -39,7 +39,26 @@ public class MainActivity extends Activity {
         }catch(Exception e){output="Import failed: "+e.getMessage();}
         final String report=output;
         final byte[] test=inspected==null?null:inspected.test;
-        runOnUiThread(()->{if(dialog.isShowing()){dialog.setMessage(report);if(test!=null){Button run=dialog.getButton(AlertDialog.BUTTON_NEUTRAL);run.setVisibility(View.VISIBLE);run.setOnClickListener(v->{run.setEnabled(false);dialog.setMessage(report+"\n\nExecuting sample...");new Thread(()->{String value;try{value=NativeEngine.runImportedTest(test);}catch(LinkageError|RuntimeException e){value="Execution error: "+e.getMessage();}final String answer=value;runOnUiThread(()->{if(dialog.isShowing()){dialog.setMessage(report+"\n\n"+answer);run.setEnabled(true);}});},"imported-arm-test").start();});}}});
+        final byte[] firmware=inspected==null?null:inspected.firmware;
+        runOnUiThread(()->{
+            if(!dialog.isShowing())return;
+            dialog.setMessage(report);
+            if(test==null&&firmware==null)return;
+            Button run=dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
+            run.setText(firmware!=null?"Trace startup":"Run test");
+            run.setVisibility(View.VISIBLE);
+            run.setOnClickListener(v->{
+                run.setEnabled(false);
+                dialog.setMessage("Running bounded CPU trace...");
+                new Thread(()->{
+                    String value;
+                    try{value=firmware!=null?NativeEngine.traceFirmware(firmware):NativeEngine.runImportedTest(test);}
+                    catch(LinkageError|RuntimeException e){value="Execution error: "+e.getMessage();}
+                    final String answer=value;
+                    runOnUiThread(()->{if(dialog.isShowing()){dialog.setMessage(firmware!=null?answer:report+"\n\n"+answer);run.setEnabled(true);}});
+                },"guest-trace").start();
+            });
+        });
     },"firmware-inspect").start();
  }
  class Phone extends View {

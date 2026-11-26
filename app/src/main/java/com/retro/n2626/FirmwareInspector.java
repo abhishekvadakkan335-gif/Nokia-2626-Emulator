@@ -19,8 +19,8 @@ final class FirmwareInspector {
         return out.toString();
     }
     static final class Inspection {
-        final String report; final byte[] test;
-        Inspection(String report, byte[] test){this.report=report;this.test=test;}
+        final String report; final byte[] test, firmware;
+        Inspection(String report, byte[] test,byte[] firmware){this.report=report;this.test=test;this.firmware=firmware;}
     }
     static Inspection inspect(InputStream in,String name) throws Exception {
         MessageDigest hash=MessageDigest.getInstance("SHA-256");
@@ -48,10 +48,17 @@ final class FirmwareInspector {
         if(modelHint)hint+="; RM-291 filename match (not content verification)";
         byte[] known={1,0,(byte)0xa0,(byte)0xe3,2,0,(byte)0x80,(byte)0xe2};
         byte[] test=total==known.length && java.util.Arrays.equals(java.util.Arrays.copyOf(header,headerSize),known)?java.util.Arrays.copyOf(header,headerSize):null;
+        String digest=hex(hash.digest(),32,false);
         String report="File: "+name+"\nSize: "+total+" bytes\nFormat: "+kind+"\nHint: "+hint+
-            "\n\nSHA-256:\n"+hex(hash.digest(),32,false)+"\n\nFirst "+headerSize+" bytes:\n"+hex(header,headerSize,true)+
+            "\n\nSHA-256:\n"+digest+"\n\nFirst "+headerSize+" bytes:\n"+hex(header,headerSize,true)+
             "\n\nRead-only inspection. Nothing executed. CPU type, load address and entry point are not determined."+(test!=null?"\nKnown ARM diagnostic sample recognized.":"");
-        if(container!=null){try{report+="\n\n"+Dct4Container.analyze(container.toByteArray());}catch(java.io.IOException e){report+="\n\nDCT4 parser rejected file: "+e.getMessage();}}
-        return new Inspection(report,test);
+        byte[] firmware=null;
+        if(container!=null){try{
+            Dct4Container.Decoded decoded=Dct4Container.analyze(container.toByteArray());
+            report+="\n\n"+decoded.report;
+            if(digest.equals("05e988ec1c87df13ede1cab96b2f498cc50ae26fdbc3c03c98ff3161c2706ee6"))firmware=decoded.image;
+            if(firmware!=null)report+="\nExperimental startup trace available for this validated sample.";
+        }catch(java.io.IOException e){report+="\n\nDCT4 parser rejected file: "+e.getMessage();}}
+        return new Inspection(report,test,firmware);
     }
 }

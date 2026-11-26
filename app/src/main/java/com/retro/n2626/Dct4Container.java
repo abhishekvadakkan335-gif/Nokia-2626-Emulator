@@ -34,7 +34,11 @@ final class Dct4Container {
         for(int j=0;j<24;j++)if((address&(1<<(j+1)))!=0)word^=ADDR[j];
         return inverse[word];
     }
-    static String analyze(byte[] b) throws IOException {
+    static final class Decoded {
+        final String report; final byte[] image;
+        Decoded(String report,byte[] image){this.report=report;this.image=image;}
+    }
+    static Decoded analyze(byte[] b) throws IOException {
         if(b.length<5||u(b,0)!=0xa2)throw new IOException("Not an A2 container");
         long header=5+be32(b,1);
         if(header<5||header>b.length||find(b,"DCT4",5,(int)header)<0)throw new IOException("Invalid or non-DCT4 header");
@@ -73,6 +77,9 @@ final class Dct4Container {
                 identity=new String(image,version,stop-version,StandardCharsets.US_ASCII).trim();}
             else identity="RM-291 marker found";
         }
-        return "DCT4 MCU container: VALID\nRecords: "+records.size()+"\nHeader/payload checksums: all passed\nFlash: "+hex(BASE)+" to "+hex(end)+" (exclusive)\nPayload: "+total+" bytes\nUnpopulated gap: "+(image.length-total)+" bytes (filled FF)\nDecoded identity:\n"+identity+"\nMIDP-2.0 marker: "+(midp>=0?"found":"not found")+"\nNo firmware executed; entry point and peripherals still unknown.";
+        boolean startup=image.length>=0x7f084 && be32(image,0x100)==0xea01fbbeL && be32(image,0x7f000)==0xe10f4000L && model>=0;
+        String report="DCT4 MCU container: VALID\nRecords: "+records.size()+"\nHeader/payload checksums: all passed\nFlash: "+hex(BASE)+" to "+hex(end)+" (exclusive)\nPayload: "+total+" bytes\nUnpopulated gap: "+(image.length-total)+" bytes (filled FF)\nDecoded identity:\n"+identity+"\nMIDP-2.0 marker: "+(midp>=0?"found":"not found")+"\nNo firmware executed; peripherals still unknown.";
+        if(startup)report+="\nCandidate startup: 0x01000100 -> 0x0107F000 (big-endian ARM).";
+        return new Decoded(report,startup?image:null);
     }
 }
