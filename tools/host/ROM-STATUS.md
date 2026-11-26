@@ -20,3 +20,9 @@ Neither memory-map source verifies the exact ROM revision or the particular rout
 - All 40 source bytes at raw flash offset 0x3a in the update container are FF; actual handset contents are unknown. Do not invent device-specific data.
 - Nokia 2610 RH-86 repair logs also identify ASIC 0x3040: https://forum.gsmhosting.com/vbb/f311/successfully-unlocked-flashed-phones-hwk-798344-print/index61.html . A matching ASIC ID is not proof of ROM compatibility.
 - The raw image and ROM are not distributed. A compatible dump or independently verified implementation is still needed.
+
+## Stage 29: isolated, opt-in HLE copy experiment
+- Reproduced strict missing-ROM baseline with 931685 callbacks on local Unicorn 2.1.4.
+- A single exploratory HLE operation was tested at the exact observed call to 0x00840000 (LR 0x0109c0ad, R0=0x1ebd4, R1=0x0900003a, R2=40). It copied the unmodified source bytes to the requested guest destination and resumed at the caller. No ROM bytes, success flags or identity data were fabricated. This copy behavior is a hypothesis, not verified ROM semantics.
+- Result: 931777 callbacks; second unresolved ROM fetch at 0x0084000e, LR 0x0109c06d, R0=0x1ebd4, R1=0x28, R2=0x1ec24, R3=0x20. The second routine is not implemented. Caller code later computes and compares a checksum, but the actual ROM transformation remains unknown.
+- Running without the optional HLE switch preserves the earlier stop exactly. The experiment does not establish that any ROM function was faithfully implemented or the OS booted.
