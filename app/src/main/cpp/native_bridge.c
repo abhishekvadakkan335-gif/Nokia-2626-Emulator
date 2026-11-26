@@ -144,6 +144,7 @@ typedef struct {
     bool reg9000_valid,reg10002_valid,read_limit;
     unsigned reg10002_reads;
     bool d00e_seen,d010_seen,reg10000_seen;
+    unsigned reg10000_status_reads,reg10000_status_first,reg10000_status_second;
     uint16_t reg9000,reg10002;
     uint64_t pc[24],recent_pc[TRACE_KEEP],fault,last,fault_value;
     uint32_t recent_size[TRACE_KEEP];
@@ -193,6 +194,19 @@ static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *d
     /* One-shot diagnostic hypothesis, not a verified reset/status value. */
     if(!t->faulted && offset==0x10000 && size==2 && t->last==0x0109bd5a && !t->reg10000_seen && t->reads<MAX_MMIO_READS){
         t->reg10000_seen=true;
+        fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
+        return 0;
+    }
+    /* Stage 20 trace: LDRH R1,[R0] at 0x0109a2fc, then bit tests.
+     * The zero path reaches LDRH R0,[R0] at 0x0109a30a.
+     * Use the same hypothetical raw status word at both exact sites.
+     * This is not a verified chipset status/reset model. */
+    if(!t->faulted && offset==0x10000 && size==2 && t->reg10000_seen &&
+       (t->last==0x0109a2fc || t->last==0x0109a30a) &&
+       t->reg10000_status_reads<32 && t->reads<MAX_MMIO_READS){
+        t->reg10000_status_reads++;
+        if(t->last==0x0109a2fc)t->reg10000_status_first++;
+        else t->reg10000_status_second++;
         fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
         return 0;
     }
@@ -373,6 +387,7 @@ done:;
         fw_write *r=i<TRACE_KEEP?&t.first_reads[i]:&t.last_reads[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nSpeculative 0x06010000 status reads: %u / 32 (PC 0x0109A2FC: %u | PC 0x0109A30A: %u), raw baseline 0x0000\n",t.reg10000_status_reads,t.reg10000_status_first,t.reg10000_status_second);
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nSpeculative 0x06010000 zero read: %s\nRecent instruction callbacks (address | bytes):\n",t.reg10000_seen?"used":"not used");
     for(unsigned i=t.count>TRACE_KEEP?t.count-TRACE_KEEP:0;i<t.count&&used<sizeof(msg);i++){
         unsigned idx=i%TRACE_KEEP,n=t.recent_size[idx];
@@ -394,6 +409,6 @@ done:;
             }
         }
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 and 0x06010002 support speculative 16-bit last-write readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. One one-shot read at 0x06010000 / PC 0x0109BD5A also returns hypothetical zero. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 and 0x06010002 support speculative 16-bit last-write readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. A one-shot read at 0x06010000 / PC 0x0109BD5A and up to 32 status reads at PCs 0x0109A2FC/0x0109A30A return hypothetical zero. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
