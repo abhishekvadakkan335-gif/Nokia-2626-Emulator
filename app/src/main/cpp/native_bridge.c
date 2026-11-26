@@ -111,6 +111,9 @@ finish:
  * can return its last written halfword. This is a hypothesis, not hardware fidelity. */
 #define PROBE_MMIO 0x06000000u
 #define PROBE_MMIO_SIZE 0x20000u
+/* Additional provisional page around observed 0x06100000 write. */
+#define PROBE_MMIO2 0x06100000u
+#define PROBE_MMIO2_SIZE 0x1000u
 #define MAX_MMIO_WRITES 32u
 #define MAX_MMIO_READS 32u
 typedef struct {uint64_t addr,value,pc; unsigned width;} fw_write;
@@ -152,6 +155,23 @@ static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t v
     t->fault=PROBE_MMIO+offset;t->fault_value=value;t->type=UC_MEM_WRITE;t->width=(int)size;
     uc_emu_stop(uc);
 }
+static uint64_t fw_mmio2_read(uc_engine *uc,uint64_t offset,unsigned size,void *data){
+    fw_trace *t=data;
+    t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO2+offset;
+    t->type=UC_MEM_READ;t->width=(int)size;
+    uc_emu_stop(uc);
+    return 0; /* no assumed read response */
+}
+static void fw_mmio2_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t value,void *data){
+    fw_trace *t=data;
+    if(!t->faulted && t->writes<MAX_MMIO_WRITES && (size==1||size==2||size==4) && offset+size<=PROBE_MMIO2_SIZE){
+        t->log[t->writes++]=(fw_write){PROBE_MMIO2+offset,value,t->last,size};
+        return; /* diagnostic write sink, no modeled side effects */
+    }
+    t->faulted=true;t->unsupported_mmio=true;t->write_limit=t->writes>=MAX_MMIO_WRITES;
+    t->fault=PROBE_MMIO2+offset;t->fault_value=value;t->type=UC_MEM_WRITE;t->width=(int)size;
+    uc_emu_stop(uc);
+}
 static void fw_code(uc_engine *uc,uint64_t address,uint32_t size,void *data){
     fw_trace *t=data;
     if(t->faulted){uc_emu_stop(uc);return;}
@@ -191,6 +211,8 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     err=uc_mem_map(uc,FW_RAM_BASE,FW_RAM_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
     t.ram_mapped=true;
     stage="map experimental MMIO readback";err=uc_mmio_map(uc,PROBE_MMIO,PROBE_MMIO_SIZE,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
+    stage="map additional experimental MMIO page";
+    err=uc_mmio_map(uc,PROBE_MMIO2,PROBE_MMIO2_SIZE,fw_mmio2_read,&t,fw_mmio2_write,&t);if(err)goto done;
     stage="initialize CPSR";err=uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     cpsr=(cpsr&~0x3fu)|0xd3u;err=uc_reg_write(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     stage="install hooks";err=uc_hook_add(uc,&h1,UC_HOOK_CODE,(void*)fw_code,&t,1,0);if(err)goto done;
@@ -216,6 +238,6 @@ done:;
         fw_write *r=&t.read_log[i];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nOnly 0x06009000 supports speculative 16-bit readback. Other reads stop. RAM window and MMIO readback are experimental; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. Only 0x06009000 supports speculative 16-bit readback. Other reads stop. RAM and MMIO are experimental; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
