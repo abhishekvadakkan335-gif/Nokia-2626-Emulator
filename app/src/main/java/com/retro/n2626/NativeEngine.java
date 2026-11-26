@@ -7,4 +7,5 @@ public final class NativeEngine {
     }
 
     public static native String testCPU();
+    public static native String runImportedTest(byte[] code);
 }

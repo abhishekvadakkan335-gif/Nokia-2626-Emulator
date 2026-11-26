@@ -20,9 +20,11 @@ public class MainActivity extends Activity {
     super.onActivityResult(request,result,data);
     if(request!=PICK_FIRMWARE||result!=RESULT_OK||data==null||data.getData()==null)return;
     final Uri uri=data.getData();
-    final AlertDialog dialog=new AlertDialog.Builder(this).setTitle("Firmware inspector").setMessage("Reading selected file...").setPositiveButton("Close",null).create();
+    final AlertDialog dialog=new AlertDialog.Builder(this).setTitle("Firmware inspector").setMessage("Reading selected file...").setPositiveButton("Close",null).setNeutralButton("Run test",null).create();
     dialog.show();
+    dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setVisibility(View.GONE);
     new Thread(()->{
+        FirmwareInspector.Inspection inspected=null;
         String name="Selected file";
         String output;
         try{
@@ -31,11 +33,13 @@ public class MainActivity extends Activity {
             }catch(Exception ignored){}
             try(java.io.InputStream stream=getContentResolver().openInputStream(uri)){
                 if(stream==null)throw new java.io.IOException("File cannot be opened");
-                output=FirmwareInspector.inspect(stream,name);
+                inspected=FirmwareInspector.inspect(stream,name);
+                output=inspected.report;
             }
         }catch(Exception e){output="Import failed: "+e.getMessage();}
         final String report=output;
-        runOnUiThread(()->{if(dialog.isShowing())dialog.setMessage(report);});
+        final byte[] test=inspected==null?null:inspected.test;
+        runOnUiThread(()->{if(dialog.isShowing()){dialog.setMessage(report);if(test!=null){Button run=dialog.getButton(AlertDialog.BUTTON_NEUTRAL);run.setVisibility(View.VISIBLE);run.setOnClickListener(v->{run.setEnabled(false);dialog.setMessage(report+"\n\nExecuting sample...");new Thread(()->{String value;try{value=NativeEngine.runImportedTest(test);}catch(LinkageError|RuntimeException e){value="Execution error: "+e.getMessage();}final String answer=value;runOnUiThread(()->{if(dialog.isShowing()){dialog.setMessage(report+"\n\n"+answer);run.setEnabled(true);}});},"imported-arm-test").start();});}}});
     },"firmware-inspect").start();
  }
  class Phone extends View {

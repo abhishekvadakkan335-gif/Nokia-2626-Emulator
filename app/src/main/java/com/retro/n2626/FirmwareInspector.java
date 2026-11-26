@@ -18,7 +18,11 @@ final class FirmwareInspector {
         }
         return out.toString();
     }
-    static String inspect(InputStream in,String name) throws Exception {
+    static final class Inspection {
+        final String report; final byte[] test;
+        Inspection(String report, byte[] test){this.report=report;this.test=test;}
+    }
+    static Inspection inspect(InputStream in,String name) throws Exception {
         MessageDigest hash=MessageDigest.getInstance("SHA-256");
         byte[] header=new byte[64],buffer=new byte[8192];
         int headerSize=0,n; long total=0;
@@ -37,8 +41,11 @@ final class FirmwareInspector {
         else if(headerSize>=2&&(header[0]&255)==0x1f&&(header[1]&255)==0x8b)kind="GZIP compressed stream";
         String lower=name.toLowerCase(Locale.ROOT);
         String hint=lower.endsWith(".mcu")?"MCU filename":lower.endsWith(".ppm")?"PPM filename":lower.endsWith(".cnt")?"CNT filename":lower.endsWith(".bin")?"BIN filename":"No recognized suffix";
-        return "File: "+name+"\nSize: "+total+" bytes\nFormat: "+kind+"\nHint: "+hint+
+        byte[] known={1,0,(byte)0xa0,(byte)0xe3,2,0,(byte)0x80,(byte)0xe2};
+        byte[] test=total==known.length && java.util.Arrays.equals(java.util.Arrays.copyOf(header,headerSize),known)?java.util.Arrays.copyOf(header,headerSize):null;
+        String report="File: "+name+"\nSize: "+total+" bytes\nFormat: "+kind+"\nHint: "+hint+
             "\n\nSHA-256:\n"+hex(hash.digest(),32,false)+"\n\nFirst "+headerSize+" bytes:\n"+hex(header,headerSize,true)+
-            "\n\nRead-only inspection. Nothing executed. CPU type, load address and entry point are not determined.";
+            "\n\nRead-only inspection. Nothing executed. CPU type, load address and entry point are not determined."+(test!=null?"\nKnown ARM diagnostic sample recognized.":"");
+        return new Inspection(report,test);
     }
 }

@@ -62,3 +62,39 @@ done:
     return (*env)->NewStringUTF(env, message);
 #undef CHECK
 }
+
+/* Only the known eight-byte diagnostic is executable in this milestone. */
+JNIEXPORT jstring JNICALL
+Java_com_retro_n2626_NativeEngine_runImportedTest(JNIEnv *env, jclass cls, jbyteArray input) {
+    (void)cls;
+    const unsigned char expected[]={1,0,0xa0,0xe3,2,0,0x80,0xe2};
+    unsigned char code[8];
+    if(!input || (*env)->GetArrayLength(env,input)!=8)
+        return (*env)->NewStringUTF(env,"Rejected: only the known diagnostic sample is supported.");
+    (*env)->GetByteArrayRegion(env,input,0,8,(jbyte*)code);
+    if((*env)->ExceptionCheck(env)) return NULL;
+    for(int i=0;i<8;i++) if(code[i]!=expected[i])
+        return (*env)->NewStringUTF(env,"Rejected: unrecognized diagnostic instructions.");
+    uc_engine *uc=NULL;
+    uc_err err;
+    uint32_t r0=0,pc=0;
+    char msg[256];
+    err=uc_open(UC_ARCH_ARM,UC_MODE_ARM,&uc);
+    if(err!=UC_ERR_OK) goto finish;
+    err=uc_mem_map(uc,ROM_BASE,PAGE_SIZE,UC_PROT_ALL);
+    if(err!=UC_ERR_OK) goto finish;
+    err=uc_mem_write(uc,ROM_BASE,code,sizeof(code));
+    if(err!=UC_ERR_OK) goto finish;
+    err=uc_mem_protect(uc,ROM_BASE,PAGE_SIZE,UC_PROT_READ|UC_PROT_EXEC);
+    if(err!=UC_ERR_OK) goto finish;
+    err=uc_emu_start(uc,ROM_BASE,ROM_BASE+8,1000000,2);
+    if(err!=UC_ERR_OK) goto finish;
+    err=uc_reg_read(uc,UC_ARM_REG_R0,&r0);
+    if(err!=UC_ERR_OK) goto finish;
+    err=uc_reg_read(uc,UC_ARM_REG_PC,&pc);
+finish:
+    snprintf(msg,sizeof(msg),"Imported ARM test: %s\nR0 = %u\nPC = 0x%08x\nEngine: %s\nNot Nokia firmware boot.",
+        err==UC_ERR_OK&&r0==3&&pc==ROM_BASE+8?"PASS":"FAIL",(unsigned)r0,(unsigned)pc,uc_strerror(err));
+    if(uc) uc_close(uc);
+    return (*env)->NewStringUTF(env,msg);
+}
