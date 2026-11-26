@@ -26,11 +26,14 @@ final class FirmwareInspector {
         MessageDigest hash=MessageDigest.getInstance("SHA-256");
         byte[] header=new byte[64],buffer=new byte[8192];
         int headerSize=0,n; long total=0;
+        java.io.ByteArrayOutputStream container=null;
         while((n=in.read(buffer))!=-1){
             if(n==0){int one=in.read();if(one==-1)break;buffer[0]=(byte)one;n=1;}
             if(total+n>LIMIT)throw new IOException("File exceeds 32 MiB inspection limit");
             int copy=Math.min(n,header.length-headerSize);
             if(copy>0){System.arraycopy(buffer,0,header,headerSize,copy);headerSize+=copy;}
+            if(total==0&&(buffer[0]&255)==0xa2)container=new java.io.ByteArrayOutputStream();
+            if(container!=null)container.write(buffer,0,n);
             hash.update(buffer,0,n);
             total+=n;
         }
@@ -48,6 +51,7 @@ final class FirmwareInspector {
         String report="File: "+name+"\nSize: "+total+" bytes\nFormat: "+kind+"\nHint: "+hint+
             "\n\nSHA-256:\n"+hex(hash.digest(),32,false)+"\n\nFirst "+headerSize+" bytes:\n"+hex(header,headerSize,true)+
             "\n\nRead-only inspection. Nothing executed. CPU type, load address and entry point are not determined."+(test!=null?"\nKnown ARM diagnostic sample recognized.":"");
+        if(container!=null){try{report+="\n\n"+Dct4Container.analyze(container.toByteArray());}catch(java.io.IOException e){report+="\n\nDCT4 parser rejected file: "+e.getMessage();}}
         return new Inspection(report,test);
     }
 }
