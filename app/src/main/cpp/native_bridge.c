@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <unicorn/unicorn.h>
 
 /* Synthetic diagnostic map only, not Nokia hardware addresses. */
@@ -126,9 +127,17 @@ finish:
 #define MAX_MMIO_WRITES 8192u
 #define MAX_MMIO_READS 512u
 #define TRACE_KEEP 16u
+#define FAST_SHADOW_LIMIT 512u
+#define FAST_ZERO_LIMIT 128u
+#define FAST_PAGE_LIMIT 64u
+#define FAST_LOW_END 0x00100000u
 typedef struct {uint64_t addr,value,pc; unsigned width;} fw_write;
 typedef struct {
     unsigned count,writes,reads;
+    bool fast;
+    unsigned fast_readback,fast_zero,fast_pages,fast_slots;
+    fw_write fast_shadow[FAST_SHADOW_LIMIT],fast_assumptions[TRACE_KEEP];
+    uint32_t fast_page_addr[FAST_PAGE_LIMIT];
     unsigned ram_reads,ram_writes,ext_reads,ext_writes;
     unsigned zero_reads,zero_writes;
     unsigned stack_reads,stack_writes,stack_switches;
@@ -160,6 +169,40 @@ static void fw_record(fw_write *first,fw_write *last,unsigned *count,fw_write ev
     if(i<TRACE_KEEP)first[i]=event;
     last[i%TRACE_KEEP]=event;
     *count=i+1;
+}
+/* Fast probe only: exact-width, last-write shadow. Overlapping writes
+ * invalidate previous entries; all values use raw Unicorn callback order.
+ * Never claim physical register behavior. */
+static void fw_fast_write(fw_trace *t,uint64_t addr,unsigned size,uint64_t value){
+    if(!t->fast)return;
+    unsigned free_slot=FAST_SHADOW_LIMIT;
+    for(unsigned i=0;i<t->fast_slots;i++){
+        fw_write *w=&t->fast_shadow[i];
+        if(w->width && addr<w->addr+w->width && w->addr<addr+size)w->width=0;
+        if(!w->width && free_slot==FAST_SHADOW_LIMIT)free_slot=i;
+    }
+    if(free_slot==FAST_SHADOW_LIMIT){
+        if(t->fast_slots==FAST_SHADOW_LIMIT)return;
+        free_slot=t->fast_slots++;
+    }
+    t->fast_shadow[free_slot]=(fw_write){addr,value,t->last,size};
+}
+static bool fw_fast_read(fw_trace *t,uint64_t addr,unsigned size,uint64_t *value){
+    if(!t->fast||t->faulted||t->reads>=MAX_MMIO_READS||!(size==1||size==2||size==4))return false;
+    for(unsigned i=0;i<t->fast_slots;i++){
+        fw_write *w=&t->fast_shadow[i];
+        if(w->width==size&&w->addr==addr){
+            *value=w->value;t->fast_readback++;
+            fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){addr,*value,t->last,size});
+            return true;
+        }
+    }
+    if(t->fast_zero>=FAST_ZERO_LIMIT)return false;
+    *value=0;
+    t->fast_assumptions[t->fast_zero%TRACE_KEEP]=(fw_write){addr,0,t->last,size};
+    t->fast_zero++;
+    fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){addr,0,t->last,size});
+    return true;
 }
 static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *data){
     fw_trace *t=data;
@@ -210,6 +253,8 @@ static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *d
         fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
         return 0;
     }
+    uint64_t candidate=0;
+    if(offset+size<=PROBE_MMIO_SIZE && fw_fast_read(t,PROBE_MMIO+offset,size,&candidate))return candidate;
     t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
     t->type=UC_MEM_READ;t->width=(int)size;
     t->read_limit=t->reads>=MAX_MMIO_READS;
@@ -220,6 +265,7 @@ static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t v
     fw_trace *t=data;
     if(!t->faulted && t->writes<MAX_MMIO_WRITES && (size==1||size==2||size==4) && offset+size<=PROBE_MMIO_SIZE){
         fw_record(t->first_writes,t->last_writes,&t->writes,(fw_write){PROBE_MMIO+offset,value,t->last,size});
+        fw_fast_write(t,PROBE_MMIO+offset,size,value);
         if(offset==0x9000&&size==2){t->reg9000=(uint16_t)value;t->reg9000_valid=true;}
         else if(offset<0x9002 && offset+size>0x9000)t->reg9000_valid=false;
         if(offset==0x10002&&size==2){t->reg10002=(uint16_t)value;t->reg10002_valid=true;}
@@ -232,6 +278,8 @@ static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t v
 }
 static uint64_t fw_mmio2_read(uc_engine *uc,uint64_t offset,unsigned size,void *data){
     fw_trace *t=data;
+    uint64_t candidate=0;
+    if(offset+size<=PROBE_MMIO2_SIZE && fw_fast_read(t,PROBE_MMIO2+offset,size,&candidate))return candidate;
     t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO2+offset;
     t->type=UC_MEM_READ;t->width=(int)size;
     uc_emu_stop(uc);
@@ -241,6 +289,7 @@ static void fw_mmio2_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t 
     fw_trace *t=data;
     if(!t->faulted && t->writes<MAX_MMIO_WRITES && (size==1||size==2||size==4) && offset+size<=PROBE_MMIO2_SIZE){
         fw_record(t->first_writes,t->last_writes,&t->writes,(fw_write){PROBE_MMIO2+offset,value,t->last,size});
+        fw_fast_write(t,PROBE_MMIO2+offset,size,value);
         return; /* diagnostic write sink, no modeled side effects */
     }
     t->faulted=true;t->unsupported_mmio=true;t->write_limit=t->writes>=MAX_MMIO_WRITES;
@@ -305,16 +354,29 @@ static void fw_stack_access(uc_engine *uc,uc_mem_type type,uint64_t address,int 
     t->stack_last_pc=t->last;
 }
 static bool fw_invalid(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
-    (void)uc;fw_trace *t=data;
+    fw_trace *t=data;
+    /* Only data writes to the provisional low-address RAM range can
+     * allocate pages automatically. Never map code fetches, flash writes,
+     * high address gaps or arbitrary peripherals. */
+    if(t->fast && !t->faulted && type==UC_MEM_WRITE_UNMAPPED && size>0 &&
+       address<FAST_LOW_END && (uint64_t)size<=FAST_LOW_END-address &&
+       t->fast_pages<FAST_PAGE_LIMIT){
+        uint64_t page=address&~0xfffULL;
+        if(address+(uint64_t)size<=page+0x1000 &&
+           uc_mem_map(uc,page,0x1000,UC_PROT_READ|UC_PROT_WRITE)==UC_ERR_OK){
+            t->fast_page_addr[t->fast_pages++]=(uint32_t)page;
+            return true;
+        }
+    }
     if(!t->faulted){t->faulted=true;t->fault=address;t->type=type;t->width=size;t->fault_value=(uint64_t)value;}
     return false;
 }
-JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv *env,jclass cls,jbyteArray input){
+JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv *env,jclass cls,jbyteArray input,jboolean fast){
     (void)cls;
     if(!input||(*env)->GetArrayLength(env,input)!=0x896f84)return (*env)->NewStringUTF(env,"Unexpected flash image size.");
     const size_t length=0x896f84,mapped=(length+4095)&~(size_t)4095;
-    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3,h4,h5,h6;fw_trace t={0};
-    uint32_t pc=0,cpsr=0,sp=0,r0=0,r1=0,r2=0,lr=0;char msg[10000];const char *stage="open";
+    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3,h4,h5,h6;fw_trace t={0};t.fast=fast==JNI_TRUE;
+    uint32_t pc=0,cpsr=0,sp=0,r0=0,r1=0,r2=0,lr=0;char msg[16000];const char *stage="open";
     err=uc_open(UC_ARCH_ARM,UC_MODE_ARM|UC_MODE_BIG_ENDIAN,&uc);if(err)goto done;
     stage="select experimental ARMv4T model";err=uc_ctl_set_cpu_model(uc,UC_CPU_ARM_TI925T);if(err)goto done;
     stage="map flash";err=uc_mem_map(uc,FW_BASE,mapped,UC_PROT_ALL);if(err)goto done;
@@ -343,11 +405,22 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     err=uc_hook_add(uc,&h4,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_ext_ram_access,&t,FW_EXT_RAM_BASE,FW_EXT_RAM_BASE+FW_EXT_RAM_SIZE-1);if(err)goto done;
     err=uc_hook_add(uc,&h5,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_zero_access,&t,FW_ZERO_BASE,FW_ZERO_BASE+FW_ZERO_SIZE-1);if(err)goto done;
     err=uc_hook_add(uc,&h6,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_stack_access,&t,FW_STACK_BASE,FW_STACK_BASE+FW_STACK_SIZE-1);if(err)goto done;
-    stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,2000000,FW_MAX_INSNS);
+    stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,t.fast?10000000:2000000,t.fast?2000000:FW_MAX_INSNS);
     uc_reg_read(uc,UC_ARM_REG_PC,&pc);uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);uc_reg_read(uc,UC_ARM_REG_SP,&sp);
     uc_reg_read(uc,UC_ARM_REG_R0,&r0);uc_reg_read(uc,UC_ARM_REG_R1,&r1);uc_reg_read(uc,UC_ARM_REG_R2,&r2);uc_reg_read(uc,UC_ARM_REG_LR,&lr);
 done:;
     size_t used=(size_t)snprintf(msg,sizeof(msg),"RM-291 startup probe\nEntry: 0x%08x\nExperimental big-endian ARMv4T\nInstruction callbacks: %u (includes faulting instruction)\nStage: %s\nEngine: %s\nPC: 0x%08x\nCPSR: 0x%08x\nSP: 0x%08x\n",FW_ENTRY,t.count,stage,uc_strerror(err),pc,cpsr,sp);
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Probe mode: %s\n",t.fast?"FAST EXPLORATION - speculative, not hardware fidelity":"STRICT - existing scoped assumptions");
+    if(t.fast && used<sizeof(msg)){
+        used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Fast fallback readbacks: %u | unknown zero reads: %u / %u\nAuto-mapped low RAM pages: %u / %u\n",t.fast_readback,t.fast_zero,FAST_ZERO_LIMIT,t.fast_pages,FAST_PAGE_LIMIT);
+        for(unsigned i=0;i<t.fast_pages&&used<sizeof(msg);i++)
+            used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Auto RAM page: 0x%08x\n",t.fast_page_addr[i]);
+        if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Most recent unknown zero assumptions (address | PC | bytes):\n");
+        for(unsigned i=t.fast_zero>TRACE_KEEP?t.fast_zero-TRACE_KEEP:0;i<t.fast_zero&&used<sizeof(msg);i++){
+            fw_write *w=&t.fast_assumptions[i%TRACE_KEEP];
+            used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 " | %u\n",w->addr,w->pc,w->width);
+        }
+    }
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Provisional RAM: %s\nWindow: 0x00010000-0x0001FFFF (64 KiB, initially zero)\nRAM reads: %u | RAM writes: %u\n",t.ram_mapped?"mapped":"not mapped",t.ram_reads,t.ram_writes);
     if((t.ram_reads||t.ram_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"RAM touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast RAM access PC: 0x%08" PRIx64 "\n",t.ram_min,t.ram_max,t.ram_last_pc);
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"External RAM: %s (provisional 2 MiB)\nWindow: 0x03000000-0x031FFFFF\nExternal reads: %u | writes: %u\n",t.ext_mapped?"mapped":"not mapped",t.ext_reads,t.ext_writes);
@@ -409,6 +482,6 @@ done:;
             }
         }
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 and 0x06010002 support speculative 16-bit last-write readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. A one-shot read at 0x06010000 / PC 0x0109BD5A and up to 32 status reads at PCs 0x0109A2FC/0x0109A30A return hypothetical zero. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 and 0x06010002 support speculative 16-bit last-write readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. A one-shot read at 0x06010000 / PC 0x0109BD5A and up to 32 status reads at PCs 0x0109A2FC/0x0109A30A return hypothetical zero. Strict mode stops other reads. Fast mode allows bounded exact-width last-write shadow reads and up to 128 unknown zero responses inside the two MMIO windows, and up to 64 low-RAM pages on data writes. RAM and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }

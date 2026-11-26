@@ -8,6 +8,7 @@ public class MainActivity extends Activity {
     dialog.show();
     new Thread(()->{String output;try{output=NativeEngine.testCPU();}catch(LinkageError|RuntimeException e){output="CPU engine unavailable: "+e.getClass().getSimpleName()+"\n"+e.getMessage();}final String result=output;runOnUiThread(()->{if(dialog.isShowing())dialog.setMessage(result+"\n\nExpected: all four checks PASS.\nSynthetic memory map only; not Nokia firmware boot.");});},"arm-self-test").start();
  }
+ private interface TraceMode { void start(boolean fast); }
  private static final int PICK_FIRMWARE=2626;
  void pickFirmware(){
     Intent i=new Intent(Intent.ACTION_OPEN_DOCUMENT);
@@ -54,19 +55,22 @@ public class MainActivity extends Activity {
             dialog.setMessage(report);
             if(test==null&&firmware==null)return;
             Button run=dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
-            run.setText(firmware!=null?"Trace startup":"Run test");
+            run.setText(firmware!=null?"Fast trace":"Run test");
+            if(firmware!=null)dialog.setMessage(report+"\n\nFast trace: bounded automatic exploration. Hold the button for strict tracing. Neither proves a completed boot.");
             run.setVisibility(View.VISIBLE);
-            run.setOnClickListener(v->{
+            TraceMode trace=fast->{
                 run.setEnabled(false);copy.setEnabled(false);
-                dialog.setMessage("Running bounded CPU trace...");
+                dialog.setMessage(fast?"Running fast exploratory CPU trace...":"Running strict CPU trace...");
                 new Thread(()->{
                     String value;
-                    try{value=firmware!=null?NativeEngine.traceFirmware(firmware):NativeEngine.runImportedTest(test);}
+                    try{value=firmware!=null?NativeEngine.traceFirmware(firmware,fast):NativeEngine.runImportedTest(test);}
                     catch(LinkageError|RuntimeException e){value="Execution error: "+e.getMessage();}
                     final String answer=value;
                     runOnUiThread(()->{if(dialog.isShowing()){currentReport[0]=firmware!=null?answer:report+"\n\n"+answer;dialog.setMessage(currentReport[0]);run.setEnabled(true);copy.setEnabled(true);}});
                 },"guest-trace").start();
-            });
+            };
+            run.setOnClickListener(v->trace.start(firmware!=null));
+            if(firmware!=null)run.setOnLongClickListener(v->{trace.start(false);return true;});
         });
     },"firmware-inspect").start();
  }
