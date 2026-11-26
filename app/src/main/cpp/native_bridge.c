@@ -106,6 +106,9 @@ finish:
 /* Hypothetical low RAM window containing the observed stack and write. */
 #define FW_RAM_BASE 0x00010000u
 #define FW_RAM_SIZE 0x00010000u
+/* Observed memory-copy destination at 0x20; do not assume contiguous RAM. */
+#define FW_ZERO_BASE 0x00000000u
+#define FW_ZERO_SIZE 0x00001000u
 /* Capacity from schematic; base inferred from observed two-halfword RAM test. */
 #define FW_EXT_RAM_BASE 0x03000000u
 #define FW_EXT_RAM_SIZE 0x00200000u
@@ -124,6 +127,9 @@ typedef struct {uint64_t addr,value,pc; unsigned width;} fw_write;
 typedef struct {
     unsigned count,writes,reads;
     unsigned ram_reads,ram_writes,ext_reads,ext_writes;
+    unsigned zero_reads,zero_writes;
+    uint64_t zero_min,zero_max,zero_last_pc;
+    bool zero_mapped;
     uint64_t ext_min,ext_max,ext_last_pc;
     bool ext_mapped;
     uint64_t ram_min,ram_max,ram_last_pc;
@@ -212,6 +218,16 @@ static void fw_ext_ram_access(uc_engine *uc,uc_mem_type type,uint64_t address,in
     if(type==UC_MEM_WRITE)t->ext_writes++;
     t->ext_last_pc=t->last;
 }
+static void fw_zero_access(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
+    (void)uc;(void)value;fw_trace *t=data;
+    if(t->faulted||size<=0)return;
+    if(t->zero_reads==0&&t->zero_writes==0){t->zero_min=address;t->zero_max=address+(uint64_t)size-1;}
+    if(address<t->zero_min)t->zero_min=address;
+    if(address+(uint64_t)size-1>t->zero_max)t->zero_max=address+(uint64_t)size-1;
+    if(type==UC_MEM_READ)t->zero_reads++;
+    if(type==UC_MEM_WRITE)t->zero_writes++;
+    t->zero_last_pc=t->last;
+}
 static bool fw_invalid(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
     (void)uc;fw_trace *t=data;
     if(!t->faulted){t->faulted=true;t->fault=address;t->type=type;t->width=size;t->fault_value=(uint64_t)value;}
@@ -221,8 +237,8 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     (void)cls;
     if(!input||(*env)->GetArrayLength(env,input)!=0x896f84)return (*env)->NewStringUTF(env,"Unexpected flash image size.");
     const size_t length=0x896f84,mapped=(length+4095)&~(size_t)4095;
-    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3,h4;fw_trace t={0};
-    uint32_t pc=0,cpsr=0,sp=0;char msg[10000];const char *stage="open";
+    uc_engine *uc=NULL;uc_err err;uc_hook h1,h2,h3,h4,h5;fw_trace t={0};
+    uint32_t pc=0,cpsr=0,sp=0,r0=0,r1=0,r2=0,lr=0;char msg[10000];const char *stage="open";
     err=uc_open(UC_ARCH_ARM,UC_MODE_ARM|UC_MODE_BIG_ENDIAN,&uc);if(err)goto done;
     stage="select experimental ARMv4T model";err=uc_ctl_set_cpu_model(uc,UC_CPU_ARM_TI925T);if(err)goto done;
     stage="map flash";err=uc_mem_map(uc,FW_BASE,mapped,UC_PROT_ALL);if(err)goto done;
@@ -234,6 +250,8 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     stage="map provisional low RAM";
     err=uc_mem_map(uc,FW_RAM_BASE,FW_RAM_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
     t.ram_mapped=true;
+    stage="map provisional zero page";err=uc_mem_map(uc,FW_ZERO_BASE,FW_ZERO_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
+    t.zero_mapped=true;
     stage="map provisional external RAM";err=uc_mem_map(uc,FW_EXT_RAM_BASE,FW_EXT_RAM_SIZE,UC_PROT_READ|UC_PROT_WRITE);if(err)goto done;
     t.ext_mapped=true;
     stage="map experimental MMIO readback";err=uc_mmio_map(uc,PROBE_MMIO,PROBE_MMIO_SIZE,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
@@ -245,14 +263,19 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     err=uc_hook_add(uc,&h2,UC_HOOK_MEM_INVALID,(void*)fw_invalid,&t,1,0);if(err)goto done;
     err=uc_hook_add(uc,&h3,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_ram_access,&t,FW_RAM_BASE,FW_RAM_BASE+FW_RAM_SIZE-1);if(err)goto done;
     err=uc_hook_add(uc,&h4,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_ext_ram_access,&t,FW_EXT_RAM_BASE,FW_EXT_RAM_BASE+FW_EXT_RAM_SIZE-1);if(err)goto done;
+    err=uc_hook_add(uc,&h5,UC_HOOK_MEM_READ|UC_HOOK_MEM_WRITE,(void*)fw_zero_access,&t,FW_ZERO_BASE,FW_ZERO_BASE+FW_ZERO_SIZE-1);if(err)goto done;
     stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,2000000,FW_MAX_INSNS);
     uc_reg_read(uc,UC_ARM_REG_PC,&pc);uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);uc_reg_read(uc,UC_ARM_REG_SP,&sp);
+    uc_reg_read(uc,UC_ARM_REG_R0,&r0);uc_reg_read(uc,UC_ARM_REG_R1,&r1);uc_reg_read(uc,UC_ARM_REG_R2,&r2);uc_reg_read(uc,UC_ARM_REG_LR,&lr);
 done:;
     size_t used=(size_t)snprintf(msg,sizeof(msg),"RM-291 startup probe\nEntry: 0x%08x\nExperimental big-endian ARMv4T\nInstruction callbacks: %u (includes faulting instruction)\nStage: %s\nEngine: %s\nPC: 0x%08x\nCPSR: 0x%08x\nSP: 0x%08x\n",FW_ENTRY,t.count,stage,uc_strerror(err),pc,cpsr,sp);
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Provisional RAM: %s\nWindow: 0x00010000-0x0001FFFF (64 KiB, initially zero)\nRAM reads: %u | RAM writes: %u\n",t.ram_mapped?"mapped":"not mapped",t.ram_reads,t.ram_writes);
     if((t.ram_reads||t.ram_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"RAM touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast RAM access PC: 0x%08" PRIx64 "\n",t.ram_min,t.ram_max,t.ram_last_pc);
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"External RAM: %s (provisional 2 MiB)\nWindow: 0x03000000-0x031FFFFF\nExternal reads: %u | writes: %u\n",t.ext_mapped?"mapped":"not mapped",t.ext_reads,t.ext_writes);
     if((t.ext_reads||t.ext_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"External RAM touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast external RAM PC: 0x%08" PRIx64 "\n",t.ext_min,t.ext_max,t.ext_last_pc);
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Zero page: %s (provisional 4 KiB, read/write only)\nZero page reads: %u | writes: %u\n",t.zero_mapped?"mapped":"not mapped",t.zero_reads,t.zero_writes);
+    if((t.zero_reads||t.zero_writes)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Zero page touched: 0x%08" PRIx64 "-0x%08" PRIx64 "\nLast zero page PC: 0x%08" PRIx64 "\n",t.zero_min,t.zero_max,t.zero_last_pc);
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"R0: 0x%08x | R1: 0x%08x\nR2: 0x%08x | LR: 0x%08x\n",r0,r1,r2,lr);
     if(!t.faulted&&err==UC_ERR_OK&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"No recorded fault; probe ended (instruction/time limit or end address). Not proof of boot.\n");
     if(t.faulted&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped access: 0x%08" PRIx64 "\nType: %d, size: %d\n",t.fault,t.type,t.width);
     if(t.faulted&&(t.type==UC_MEM_WRITE||t.type==UC_MEM_WRITE_UNMAPPED||t.type==UC_MEM_WRITE_PROT)&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Attempted write value: 0x%" PRIx64 "\n",t.fault_value);
@@ -277,6 +300,6 @@ done:;
         fw_write *r=i<TRACE_KEEP?&t.first_reads[i]:&t.last_reads[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. Only 0x06009000 supports speculative 16-bit readback. Other reads stop. Both RAM windows and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. Only 0x06009000 supports speculative 16-bit readback. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
