@@ -19,7 +19,8 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install matching host Unicorn
-        run: python -m pip install --only-binary=:all: unicorn==2.1.4
+        run: |
+          python -m pip install --only-binary=:all: unicorn==2.1.4
       - name: Build host JNI library and runner
         run: |
           set -eu
