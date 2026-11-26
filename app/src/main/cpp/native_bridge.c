@@ -135,9 +135,10 @@ typedef struct {
     uint64_t ram_min,ram_max,ram_last_pc;
     bool ram_mapped;
     bool reg9000_valid,read_limit;
-    bool d00e_seen,d010_seen;
+    bool d00e_seen,d010_seen,reg10000_seen;
     uint16_t reg9000;
-    uint64_t pc[24],fault,last,fault_value;
+    uint64_t pc[24],recent_pc[TRACE_KEEP],fault,last,fault_value;
+    uint32_t recent_size[TRACE_KEEP];
     uint32_t size[24];
     int type,width;
     bool faulted,unsupported_mmio,write_limit;
@@ -171,6 +172,12 @@ static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *d
             fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
             return 0;
         }
+    }
+    /* One-shot diagnostic hypothesis, not a verified reset/status value. */
+    if(!t->faulted && offset==0x10000 && size==2 && t->last==0x0109bd5a && !t->reg10000_seen && t->reads<MAX_MMIO_READS){
+        t->reg10000_seen=true;
+        fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
+        return 0;
     }
     t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
     t->type=UC_MEM_READ;t->width=(int)size;
@@ -211,6 +218,8 @@ static void fw_code(uc_engine *uc,uint64_t address,uint32_t size,void *data){
     fw_trace *t=data;
     if(t->faulted){uc_emu_stop(uc);return;}
     if(t->count<24){t->pc[t->count]=address;t->size[t->count]=size;}
+    t->recent_pc[t->count%TRACE_KEEP]=address;
+    t->recent_size[t->count%TRACE_KEEP]=size;
     t->count++;t->last=address;
 }
 static void fw_ram_access(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
@@ -316,6 +325,27 @@ done:;
         fw_write *r=i<TRACE_KEEP?&t.first_reads[i]:&t.last_reads[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 supports speculative 16-bit readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nSpeculative 0x06010000 zero read: %s\nRecent instruction callbacks (address | bytes):\n",t.reg10000_seen?"used":"not used");
+    for(unsigned i=t.count>TRACE_KEEP?t.count-TRACE_KEEP:0;i<t.count&&used<sizeof(msg);i++){
+        unsigned idx=i%TRACE_KEEP,n=t.recent_size[idx];
+        uint64_t addr=t.recent_pc[idx];
+        unsigned char raw[4]={0};
+        if(uc && (n==2||n==4) && addr>=FW_BASE && addr+n<=FW_BASE+length && uc_mem_read(uc,addr,raw,n)==UC_ERR_OK){
+            if(n==2)used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | %02x%02x\n",addr,(unsigned)raw[0],(unsigned)raw[1]);
+            else used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | %02x%02x%02x%02x\n",addr,(unsigned)raw[0],(unsigned)raw[1],(unsigned)raw[2],(unsigned)raw[3]);
+        }else used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | unavailable (size %u)\n",addr,n);
+    }
+    /* Read only flash bytes around the stop PC; never sample MMIO. */
+    if(uc && t.count && t.last>=FW_BASE+16 && t.last+48<=FW_BASE+length && used<sizeof(msg)){
+        uint64_t addr=t.last-16;
+        unsigned char raw[64];
+        if(uc_mem_read(uc,addr,raw,sizeof(raw))==UC_ERR_OK){
+            used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nFlash bytes around stopping instruction:\n");
+            for(unsigned i=0;i<sizeof(raw)&&used<sizeof(msg);i+=8){
+                used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | %02x%02x %02x%02x %02x%02x %02x%02x\n",addr+i,(unsigned)raw[i],(unsigned)raw[i+1],(unsigned)raw[i+2],(unsigned)raw[i+3],(unsigned)raw[i+4],(unsigned)raw[i+5],(unsigned)raw[i+6],(unsigned)raw[i+7]);
+            }
+        }
+    }
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 supports speculative 16-bit readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. One one-shot read at 0x06010000 / PC 0x0109BD5A also returns hypothetical zero. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
