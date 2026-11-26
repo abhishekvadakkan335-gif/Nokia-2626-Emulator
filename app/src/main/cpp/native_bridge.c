@@ -103,10 +103,33 @@ finish:
 
 #define FW_BASE 0x01000000u
 #define FW_ENTRY 0x01000100u
-typedef struct {unsigned count; uint64_t pc[24],fault; uint32_t size[24]; int type,width; bool faulted;} fw_trace;
+#define PROBE_MMIO 0x06010000u
+typedef struct {
+    unsigned count, writes;
+    uint64_t pc[24],fault,last,write_value,write_pc;
+    uint32_t size[24];
+    int type,width;
+    bool faulted, unsupported_mmio;
+} fw_trace;
+static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *data){
+    fw_trace *t=data;
+    t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
+    t->type=UC_MEM_READ;t->width=(int)size;
+    uc_emu_stop(uc);
+    return 0; /* placeholder required by API; trace stops, no hardware response claimed */
+}
+static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t value,void *data){
+    fw_trace *t=data;
+    if(offset==4&&size==2&&t->last==0x0107f04e&&t->writes==0){
+        t->writes++;t->write_value=value;t->write_pc=t->last;
+        return; /* exploratory sink, not verified register behavior */
+    }
+    t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
+    t->type=UC_MEM_WRITE;t->width=(int)size;uc_emu_stop(uc);
+}
 static void fw_code(uc_engine *uc,uint64_t address,uint32_t size,void *data){
     (void)uc; fw_trace *t=data;
-    if(t->count<24){t->pc[t->count]=address;t->size[t->count]=size;}t->count++;
+    if(t->count<24){t->pc[t->count]=address;t->size[t->count]=size;}t->count++;t->last=address;
 }
 static bool fw_invalid(uc_engine *uc,uc_mem_type type,uint64_t address,int size,int64_t value,void *data){
     (void)uc;(void)value;fw_trace *t=data;t->faulted=true;t->fault=address;t->type=type;t->width=size;return false;
@@ -116,7 +139,7 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     if(!input||(*env)->GetArrayLength(env,input)!=0x896f84)return (*env)->NewStringUTF(env,"Unexpected flash image size.");
     const size_t length=0x896f84,mapped=(length+4095)&~(size_t)4095;
     uc_engine *uc=NULL;uc_err err;uc_hook h1,h2;fw_trace t={0};
-    uint32_t pc=0,cpsr=0,sp=0;char msg[2400];const char *stage="open";
+    uint32_t pc=0,cpsr=0,sp=0;char msg[3000];const char *stage="open";
     err=uc_open(UC_ARCH_ARM,UC_MODE_ARM|UC_MODE_BIG_ENDIAN,&uc);if(err)goto done;
     stage="select experimental ARMv4T model";err=uc_ctl_set_cpu_model(uc,UC_CPU_ARM_TI925T);if(err)goto done;
     stage="map flash";err=uc_mem_map(uc,FW_BASE,mapped,UC_PROT_ALL);if(err)goto done;
@@ -125,17 +148,20 @@ JNIEXPORT jstring JNICALL Java_com_retro_n2626_NativeEngine_traceFirmware(JNIEnv
     stage="copy flash";err=uc_mem_write(uc,FW_BASE,bytes,length);
     (*env)->ReleaseByteArrayElements(env,input,bytes,JNI_ABORT);if(err)goto done;
     stage="protect flash";err=uc_mem_protect(uc,FW_BASE,mapped,UC_PROT_READ|UC_PROT_EXEC);if(err)goto done;
+    stage="map experimental MMIO write sink";err=uc_mmio_map(uc,PROBE_MMIO,4096,fw_mmio_read,&t,fw_mmio_write,&t);if(err)goto done;
     stage="initialize CPSR";err=uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     cpsr=(cpsr&~0x3fu)|0xd3u;err=uc_reg_write(uc,UC_ARM_REG_CPSR,&cpsr);if(err)goto done;
     stage="install hooks";err=uc_hook_add(uc,&h1,UC_HOOK_CODE,(void*)fw_code,&t,1,0);if(err)goto done;
     err=uc_hook_add(uc,&h2,UC_HOOK_MEM_INVALID,(void*)fw_invalid,&t,1,0);if(err)goto done;
-    stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,1000000,64);
+    stage="guest execution";err=uc_emu_start(uc,FW_ENTRY,FW_BASE+length,1000000,256);
     uc_reg_read(uc,UC_ARM_REG_PC,&pc);uc_reg_read(uc,UC_ARM_REG_CPSR,&cpsr);uc_reg_read(uc,UC_ARM_REG_SP,&sp);
 done:;
     size_t used=(size_t)snprintf(msg,sizeof(msg),"RM-291 startup probe\nEntry: 0x%08x\nExperimental big-endian ARMv4T\nInstruction callbacks: %u (includes faulting instruction)\nStage: %s\nEngine: %s\nPC: 0x%08x\nCPSR: 0x%08x\nSP: 0x%08x\n",FW_ENTRY,t.count,stage,uc_strerror(err),pc,cpsr,sp);
-    if(t.faulted&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Unmapped/protected access: 0x%08" PRIx64 "\nType: %d, size: %d\n",t.fault,t.type,t.width);
+    if(t.writes&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Accepted exploratory write: 0x06010004\n16-bit value: 0x%04" PRIx64 "\nGuest PC: 0x%08" PRIx64 "\n",t.write_value,t.write_pc);
+    if(t.unsupported_mmio&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped: unsupported MMIO access (do not treat engine OK as boot success).\n");
+    if(t.faulted&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped access: 0x%08" PRIx64 "\nType: %d, size: %d\n",t.fault,t.type,t.width);
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nFirst instruction addresses (bytes):\n");
     for(unsigned i=0;i<t.count&&i<24&&used<sizeof(msg);i++)used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " (%u)\n",t.pc[i],t.size[i]);
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nNo RAM or peripherals mapped. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nLast callback PC: 0x%08" PRIx64 "\nOne exploratory MMIO write sink; no RAM or verified peripherals. Not a completed OS boot.",t.last);
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
