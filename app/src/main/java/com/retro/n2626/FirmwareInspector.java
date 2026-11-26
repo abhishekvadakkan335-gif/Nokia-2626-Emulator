@@ -40,7 +40,9 @@ final class FirmwareInspector {
         else if(headerSize>=4&&header[0]=='P'&&header[1]=='K'&&((header[2]==3&&header[3]==4)||(header[2]==5&&header[3]==6)||(header[2]==7&&header[3]==8)))kind="ZIP-family archive";
         else if(headerSize>=2&&(header[0]&255)==0x1f&&(header[1]&255)==0x8b)kind="GZIP compressed stream";
         String lower=name.toLowerCase(Locale.ROOT);
-        String hint=lower.endsWith(".mcu")?"MCU filename":lower.endsWith(".ppm")?"PPM filename":lower.endsWith(".cnt")?"CNT filename":lower.endsWith(".bin")?"BIN filename":"No recognized suffix";
+        boolean modelHint=lower.contains("rm291")||lower.contains("rm-291");
+        String hint=lower.endsWith(".mcusw")||lower.endsWith(".mcu")?"MCU software candidate":lower.endsWith(".ppm")||lower.contains(".ppm_")?"PPM resource candidate":lower.endsWith(".cnt")||lower.contains(".image_")||lower.endsWith(".image")?"CNT/content candidate":lower.endsWith(".bin")?"BIN filename":"No recognized suffix";
+        if(modelHint)hint+="; RM-291 filename match (not content verification)";
         byte[] known={1,0,(byte)0xa0,(byte)0xe3,2,0,(byte)0x80,(byte)0xe2};
         byte[] test=total==known.length && java.util.Arrays.equals(java.util.Arrays.copyOf(header,headerSize),known)?java.util.Arrays.copyOf(header,headerSize):null;
         String report="File: "+name+"\nSize: "+total+" bytes\nFormat: "+kind+"\nHint: "+hint+
