@@ -113,8 +113,8 @@ finish:
 #define FW_EXT_RAM_BASE 0x03000000u
 #define FW_EXT_RAM_SIZE 0x00200000u
 #define FW_MAX_INSNS 200000u
-/* Exploratory MMIO region. Only the observed register at 0x06009000
- * can return its last written halfword. This is a hypothesis, not hardware fidelity. */
+/* Exploratory MMIO region. 0x06009000 has speculative readback.
+ * Two one-shot startup reads at 0x0600D00E/10 return hypothetical zero. */
 #define PROBE_MMIO 0x06000000u
 #define PROBE_MMIO_SIZE 0x20000u
 /* Additional provisional page around observed 0x06100000 write. */
@@ -135,6 +135,7 @@ typedef struct {
     uint64_t ram_min,ram_max,ram_last_pc;
     bool ram_mapped;
     bool reg9000_valid,read_limit;
+    bool d00e_seen,d010_seen;
     uint16_t reg9000;
     uint64_t pc[24],fault,last,fault_value;
     uint32_t size[24];
@@ -156,6 +157,20 @@ static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *d
         uint16_t value=t->reg9000;
         fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,value,t->last,size});
         return value;
+    }
+    /* These exact Thumb LDRH sites follow the observed D000 initialization.
+     * No device semantics or reset register values are established. */
+    if(!t->faulted && size==2 && t->reads<MAX_MMIO_READS){
+        if(offset==0xd00e && t->last==0x01247610 && !t->d00e_seen){
+            t->d00e_seen=true;
+            fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
+            return 0;
+        }
+        if(offset==0xd010 && t->last==0x01247612 && t->d00e_seen && !t->d010_seen){
+            t->d010_seen=true;
+            fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,0,t->last,size});
+            return 0;
+        }
     }
     t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
     t->type=UC_MEM_READ;t->width=(int)size;
@@ -290,6 +305,7 @@ done:;
         fw_write *w=i<TRACE_KEEP?&t.first_writes[i]:&t.last_writes[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",w->addr,w->value,w->pc,w->width);
     }
+    if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nSpeculative D000 zero reads: D00E=%s | D010=%s\n",t.d00e_seen?"used":"not used",t.d010_seen?"used":"not used");
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nExperimental reads: %u / %u\nAddress | Raw MMIO return value | Guest PC | Bytes\n",t.reads,MAX_MMIO_READS);
     for(unsigned i=0;i<t.reads&&used<sizeof(msg);i++){
         if(i==TRACE_KEEP && t.reads>2*TRACE_KEEP){
@@ -300,6 +316,6 @@ done:;
         fw_write *r=i<TRACE_KEEP?&t.first_reads[i]:&t.last_reads[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
-    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. Only 0x06009000 supports speculative 16-bit readback. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
+    if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. 0x06009000 supports speculative 16-bit readback. Two one-shot startup reads at 0x0600D00E and 0x0600D010 return hypothetical zero only at PCs 0x01247610 and 0x01247612. Other reads stop. RAM windows, zero page and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");
     if(uc)uc_close(uc);return (*env)->NewStringUTF(env,msg);
 }
