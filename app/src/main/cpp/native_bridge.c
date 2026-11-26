@@ -117,8 +117,9 @@ finish:
 /* Additional provisional page around observed 0x06100000 write. */
 #define PROBE_MMIO2 0x06100000u
 #define PROBE_MMIO2_SIZE 0x1000u
-#define MAX_MMIO_WRITES 32u
-#define MAX_MMIO_READS 32u
+#define MAX_MMIO_WRITES 8192u
+#define MAX_MMIO_READS 512u
+#define TRACE_KEEP 16u
 typedef struct {uint64_t addr,value,pc; unsigned width;} fw_write;
 typedef struct {
     unsigned count,writes,reads;
@@ -133,13 +134,21 @@ typedef struct {
     uint32_t size[24];
     int type,width;
     bool faulted,unsupported_mmio,write_limit;
-    fw_write log[MAX_MMIO_WRITES],read_log[MAX_MMIO_READS];
+    fw_write first_writes[TRACE_KEEP],last_writes[TRACE_KEEP];
+    fw_write first_reads[TRACE_KEEP],last_reads[TRACE_KEEP];
 } fw_trace;
+/* Keep first and last samples; total counters remain independent of display. */
+static void fw_record(fw_write *first,fw_write *last,unsigned *count,fw_write event){
+    unsigned i=*count;
+    if(i<TRACE_KEEP)first[i]=event;
+    last[i%TRACE_KEEP]=event;
+    *count=i+1;
+}
 static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *data){
     fw_trace *t=data;
     if(!t->faulted && offset==0x9000 && size==2 && t->reg9000_valid && t->reads<MAX_MMIO_READS){
         uint16_t value=t->reg9000;
-        t->read_log[t->reads++]=(fw_write){PROBE_MMIO+offset,value,t->last,size};
+        fw_record(t->first_reads,t->last_reads,&t->reads,(fw_write){PROBE_MMIO+offset,value,t->last,size});
         return value;
     }
     t->faulted=true;t->unsupported_mmio=true;t->fault=PROBE_MMIO+offset;
@@ -151,7 +160,7 @@ static uint64_t fw_mmio_read(uc_engine *uc,uint64_t offset,unsigned size,void *d
 static void fw_mmio_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t value,void *data){
     fw_trace *t=data;
     if(!t->faulted && t->writes<MAX_MMIO_WRITES && (size==1||size==2||size==4) && offset+size<=PROBE_MMIO_SIZE){
-        t->log[t->writes++]=(fw_write){PROBE_MMIO+offset,value,t->last,size};
+        fw_record(t->first_writes,t->last_writes,&t->writes,(fw_write){PROBE_MMIO+offset,value,t->last,size});
         if(offset==0x9000&&size==2){t->reg9000=(uint16_t)value;t->reg9000_valid=true;}
         else if(offset<0x9002 && offset+size>0x9000)t->reg9000_valid=false;
         return; /* all other writes are logged only */
@@ -170,7 +179,7 @@ static uint64_t fw_mmio2_read(uc_engine *uc,uint64_t offset,unsigned size,void *
 static void fw_mmio2_write(uc_engine *uc,uint64_t offset,unsigned size,uint64_t value,void *data){
     fw_trace *t=data;
     if(!t->faulted && t->writes<MAX_MMIO_WRITES && (size==1||size==2||size==4) && offset+size<=PROBE_MMIO2_SIZE){
-        t->log[t->writes++]=(fw_write){PROBE_MMIO2+offset,value,t->last,size};
+        fw_record(t->first_writes,t->last_writes,&t->writes,(fw_write){PROBE_MMIO2+offset,value,t->last,size});
         return; /* diagnostic write sink, no modeled side effects */
     }
     t->faulted=true;t->unsupported_mmio=true;t->write_limit=t->writes>=MAX_MMIO_WRITES;
@@ -250,12 +259,22 @@ done:;
     if(t.unsupported_mmio&&used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Stopped: %s. Engine OK does not imply boot success.\n",t.write_limit?"exploratory write limit":t.read_limit?"exploratory read limit":"unsupported MMIO");
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"Last callback PC: 0x%08" PRIx64 "\n\nExploratory writes: %u / %u\nAddress | Raw MMIO callback value | Guest PC | Bytes\n",t.last,t.writes,MAX_MMIO_WRITES);
     for(unsigned i=0;i<t.writes&&used<sizeof(msg);i++){
-        fw_write *w=&t.log[i];
+        if(i==TRACE_KEEP && t.writes>2*TRACE_KEEP){
+            used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"... %u middle writes omitted ...\n",t.writes-2*TRACE_KEEP);
+            i=t.writes-TRACE_KEEP;
+            if(used>=sizeof(msg))break;
+        }
+        fw_write *w=i<TRACE_KEEP?&t.first_writes[i]:&t.last_writes[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",w->addr,w->value,w->pc,w->width);
     }
     if(used<sizeof(msg))used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"\nExperimental reads: %u / %u\nAddress | Raw MMIO return value | Guest PC | Bytes\n",t.reads,MAX_MMIO_READS);
     for(unsigned i=0;i<t.reads&&used<sizeof(msg);i++){
-        fw_write *r=&t.read_log[i];
+        if(i==TRACE_KEEP && t.reads>2*TRACE_KEEP){
+            used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"... %u middle reads omitted ...\n",t.reads-2*TRACE_KEEP);
+            i=t.reads-TRACE_KEEP;
+            if(used>=sizeof(msg))break;
+        }
+        fw_write *r=i<TRACE_KEEP?&t.first_reads[i]:&t.last_reads[i%TRACE_KEEP];
         used+=(size_t)snprintf(msg+used,sizeof(msg)-used,"0x%08" PRIx64 " | 0x%08" PRIx64 "\nPC 0x%08" PRIx64 " | %u\n",r->addr,r->value,r->pc,r->width);
     }
     if(used<sizeof(msg))snprintf(msg+used,sizeof(msg)-used,"\nProbe windows: 0x06000000-0x0601FFFF and 0x06100000-0x06100FFF. Only 0x06009000 supports speculative 16-bit readback. Other reads stop. Both RAM windows and MMIO are experimental. MMIO callback values may differ in byte order from guest CPU write values; no verified hardware side effects. Not a completed OS boot.");

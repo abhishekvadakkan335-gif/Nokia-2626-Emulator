@@ -20,9 +20,17 @@ public class MainActivity extends Activity {
     super.onActivityResult(request,result,data);
     if(request!=PICK_FIRMWARE||result!=RESULT_OK||data==null||data.getData()==null)return;
     final Uri uri=data.getData();
-    final AlertDialog dialog=new AlertDialog.Builder(this).setTitle("Firmware inspector").setMessage("Reading selected file...").setPositiveButton("Close",null).setNeutralButton("Run test",null).create();
+    final AlertDialog dialog=new AlertDialog.Builder(this).setTitle("Firmware inspector").setMessage("Reading selected file...").setPositiveButton("Close",null).setNeutralButton("Run test",null).setNegativeButton("Copy report",null).create();
     dialog.show();
     dialog.getButton(AlertDialog.BUTTON_NEUTRAL).setVisibility(View.GONE);
+    final String[] currentReport={null};
+    Button copy=dialog.getButton(AlertDialog.BUTTON_NEGATIVE);
+    copy.setEnabled(false);
+    copy.setOnClickListener(v->{
+        if(currentReport[0]==null)return;
+        android.content.ClipboardManager clipboard=(android.content.ClipboardManager)getSystemService(Context.CLIPBOARD_SERVICE);
+        if(clipboard!=null){clipboard.setPrimaryClip(ClipData.newPlainText("Nokia diagnostic report",currentReport[0]));Toast.makeText(this,"Report copied",Toast.LENGTH_SHORT).show();}
+    });
     new Thread(()->{
         FirmwareInspector.Inspection inspected=null;
         String name="Selected file";
@@ -42,20 +50,21 @@ public class MainActivity extends Activity {
         final byte[] firmware=inspected==null?null:inspected.firmware;
         runOnUiThread(()->{
             if(!dialog.isShowing())return;
+            currentReport[0]=report;copy.setEnabled(true);
             dialog.setMessage(report);
             if(test==null&&firmware==null)return;
             Button run=dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
             run.setText(firmware!=null?"Trace startup":"Run test");
             run.setVisibility(View.VISIBLE);
             run.setOnClickListener(v->{
-                run.setEnabled(false);
+                run.setEnabled(false);copy.setEnabled(false);
                 dialog.setMessage("Running bounded CPU trace...");
                 new Thread(()->{
                     String value;
                     try{value=firmware!=null?NativeEngine.traceFirmware(firmware):NativeEngine.runImportedTest(test);}
                     catch(LinkageError|RuntimeException e){value="Execution error: "+e.getMessage();}
                     final String answer=value;
-                    runOnUiThread(()->{if(dialog.isShowing()){dialog.setMessage(firmware!=null?answer:report+"\n\n"+answer);run.setEnabled(true);}});
+                    runOnUiThread(()->{if(dialog.isShowing()){currentReport[0]=firmware!=null?answer:report+"\n\n"+answer;dialog.setMessage(currentReport[0]);run.setEnabled(true);copy.setEnabled(true);}});
                 },"guest-trace").start();
             });
         });
