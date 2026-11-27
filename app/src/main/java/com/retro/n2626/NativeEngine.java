@@ -9,4 +9,5 @@ public final class NativeEngine {
     public static native String testCPU();
     public static native String runImportedTest(byte[] code);
     public static native String traceFirmware(byte[] image, boolean fast);
+    public static native String traceFull(byte[] decoded, byte[] raw, boolean explore);
 }

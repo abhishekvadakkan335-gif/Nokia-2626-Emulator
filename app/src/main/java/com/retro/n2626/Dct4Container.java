@@ -34,6 +34,69 @@ final class Dct4Container {
         for(int j=0;j<24;j++)if((address&(1<<(j+1)))!=0)word^=ADDR[j];
         return inverse[word];
     }
+    // Matching 06.81 archive only; verify each component and combined image.
+    static final class Full {
+        final byte[] decoded,raw;
+        Full(byte[] decoded,byte[] raw){this.decoded=decoded;this.raw=raw;}
+    }
+    private static String sha256(byte[] b) throws Exception {
+        byte[] h=java.security.MessageDigest.getInstance("SHA-256").digest(b);
+        StringBuilder s=new StringBuilder();for(byte v:h)s.append(String.format(Locale.ROOT,"%02x",v&255));return s.toString();
+    }
+    static Full fullZip(java.io.InputStream in) throws Exception {
+        String[] suffix={"mcusw","ppm_ej","image_ej"};
+        String[] digests={"3b8bb5b503f7deba62ccc187e74eeea3d65c2b7d358c8d0137604449c8fbce36","2240a70dc6bbb6b224e49a3c19ef0d223a31d08988a041582aafc6a643073db1","05825a81f5639ba72a70a2fc9e1b5457356682a8b300d171ffd00fdf9986e1d3"};
+        int[] starts={BASE,0x018e0000,0x01b80000}, ends={0x01897154,0x01a78118,0x01d60000};
+        byte[][] components=new byte[3][];
+        long total=0;int entries=0;
+        try(java.util.zip.ZipInputStream z=new java.util.zip.ZipInputStream(in)){
+            java.util.zip.ZipEntry ent;
+            while((ent=z.getNextEntry())!=null){
+                if(++entries>128)throw new IOException("Too many archive entries");
+                int k=-1;
+                for(int i=0;i<3;i++)if(ent.getName().equals("Nokia_2626_RM-291/Firmware/rm291__06.81."+suffix[i]))k=i;
+                java.io.ByteArrayOutputStream out=k<0?null:new java.io.ByteArrayOutputStream();
+                byte[] buf=new byte[16384];int r;long entryBytes=0;
+                while((r=z.read(buf))!=-1){
+                    total+=r;entryBytes+=r;
+                    if(total>32L*1024*1024||entryBytes>16L*1024*1024)throw new IOException("Archive exceeds size limit");
+                    if(out!=null)out.write(buf,0,r);
+                }
+                if(k>=0){if(components[k]!=null)throw new IOException("Duplicate component");components[k]=out.toByteArray();}
+                z.closeEntry();
+            }
+        }
+        byte[] raw=new byte[0xd60000];Arrays.fill(raw,(byte)255);
+        ArrayList<int[]> mcu=new ArrayList<>();int count=0;
+        for(int k=0;k<3;k++){
+            byte[] b=components[k];
+            if(b==null||!sha256(b).equals(digests[k])||b.length<5||u(b,0)!=0xa2)throw new IOException("Missing or unexpected 06.81 "+suffix[k]);
+            long head=5+be32(b,1);
+            if(head<5||head>b.length||find(b,"DCT4",5,(int)head)<0)throw new IOException("Bad header");
+            int p=(int)head,last=starts[k];boolean first=true;
+            while(p<b.length){
+                if(++count>774||b.length-p<10||u(b,p)!=0x14)throw new IOException("Unexpected record");
+                long addr=be32(b,p+1);int len=(u(b,p+6)<<16)|(u(b,p+7)<<8)|u(b,p+8);
+                if((first&&addr!=starts[k])||addr<last||addr+len>ends[k]||len<=0||len>b.length-p-10||((addr|len)&1)!=0)throw new IOException("Bad record range");
+                int h=0;for(int i=p+1;i<p+10;i++)h+=u(b,i);
+                int pay=u(b,p+5);for(int i=p+10;i<p+10+len;i++)pay+=u(b,i);
+                if((h&255)!=255||(pay&255)!=0)throw new IOException("Record checksum mismatch");
+                System.arraycopy(b,p+10,raw,(int)addr-BASE,len);
+                if(k==0)mcu.add(new int[]{(int)addr-BASE,len});
+                last=(int)addr+len;p+=10+len;first=false;
+            }
+            if(last!=ends[k])throw new IOException("Component end mismatch");
+        }
+        if(count!=774||!sha256(raw).equals("7687b11edab6e1588b376bf5510aae31e4252c6156ecf4f9049efe209802e11b"))throw new IOException("Raw flash hash mismatch");
+        byte[] decoded=raw.clone();int[] inv=inverse();
+        int param=transform((u(raw,CLEAR)<<8)|u(raw,CLEAR+1),BASE+CLEAR,inv)^0xffff;
+        for(int[] r:mcu)for(int i=Math.max(CLEAR,r[0]);i<r[0]+r[1];i+=2){
+            int w=transform((u(raw,i)<<8)|u(raw,i+1),BASE+i,inv)^param;
+            decoded[i]=(byte)(w>>>8);decoded[i+1]=(byte)w;
+        }
+        if(!sha256(decoded).equals("410eda8d7d17570b31758aadb98dba956adcb70028ae2e011abf88d19e65181b"))throw new IOException("Decoded flash hash mismatch");
+        return new Full(decoded,raw);
+    }
     static final class Decoded {
         final String report; final byte[] image;
         Decoded(String report,byte[] image){this.report=report;this.image=image;}

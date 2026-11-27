@@ -34,6 +34,7 @@ public class MainActivity extends Activity {
     });
     new Thread(()->{
         FirmwareInspector.Inspection inspected=null;
+        Dct4Container.Full full=null;
         String name="Selected file";
         String output;
         try{
@@ -42,10 +43,13 @@ public class MainActivity extends Activity {
             }catch(Exception ignored){}
             try(java.io.InputStream stream=getContentResolver().openInputStream(uri)){
                 if(stream==null)throw new java.io.IOException("File cannot be opened");
-                inspected=FirmwareInspector.inspect(stream,name);
-                output=inspected.report;
+                java.io.BufferedInputStream buffered=new java.io.BufferedInputStream(stream);
+                buffered.mark(4);int first=buffered.read(),second=buffered.read();buffered.reset();
+                if(first==80&&second==75){full=Dct4Container.fullZip(buffered);output="Full RM-291 06.81 flash verified. 774 record checksums, both flash hashes. Experimental host-model Android port. Tap Explore startup to test speculative ROM/peripheral responses; hold for strict ROM trap. This is not an OS boot.";}
+                else {inspected=FirmwareInspector.inspect(buffered,name);output=inspected.report;}
             }
         }catch(Exception e){output="Import failed: "+e.getMessage();}
+        final Dct4Container.Full complete=full;
         final String report=output;
         final byte[] test=inspected==null?null:inspected.test;
         final byte[] firmware=inspected==null?null:inspected.firmware;
@@ -53,9 +57,9 @@ public class MainActivity extends Activity {
             if(!dialog.isShowing())return;
             currentReport[0]=report;copy.setEnabled(true);
             dialog.setMessage(report);
-            if(test==null&&firmware==null)return;
+            if(test==null&&firmware==null&&complete==null)return;
             Button run=dialog.getButton(AlertDialog.BUTTON_NEUTRAL);
-            run.setText(firmware!=null?"Fast trace":"Run test");
+            run.setText(complete!=null?"Explore startup":firmware!=null?"Fast trace":"Run test");
             if(firmware!=null)dialog.setMessage(report+"\n\nFast trace: bounded automatic exploration. Hold the button for strict tracing. Neither proves a completed boot.");
             run.setVisibility(View.VISIBLE);
             TraceMode trace=fast->{
@@ -63,14 +67,14 @@ public class MainActivity extends Activity {
                 dialog.setMessage(fast?"Running fast exploratory CPU trace...":"Running strict CPU trace...");
                 new Thread(()->{
                     String value;
-                    try{value=firmware!=null?NativeEngine.traceFirmware(firmware,fast):NativeEngine.runImportedTest(test);}
+                    try{value=complete!=null?NativeEngine.traceFull(complete.decoded,complete.raw,fast):firmware!=null?NativeEngine.traceFirmware(firmware,fast):NativeEngine.runImportedTest(test);}
                     catch(LinkageError|RuntimeException e){value="Execution error: "+e.getMessage();}
                     final String answer=value;
-                    runOnUiThread(()->{if(dialog.isShowing()){currentReport[0]=firmware!=null?answer:report+"\n\n"+answer;dialog.setMessage(currentReport[0]);run.setEnabled(true);copy.setEnabled(true);}});
+                    runOnUiThread(()->{if(dialog.isShowing()){currentReport[0]=(firmware!=null||complete!=null)?answer:report+"\n\n"+answer;dialog.setMessage(currentReport[0]);run.setEnabled(true);copy.setEnabled(true);}});
                 },"guest-trace").start();
             };
-            run.setOnClickListener(v->trace.start(firmware!=null));
-            if(firmware!=null)run.setOnLongClickListener(v->{trace.start(false);return true;});
+            run.setOnClickListener(v->trace.start(firmware!=null||complete!=null));
+            if(firmware!=null||complete!=null)run.setOnLongClickListener(v->{trace.start(false);return true;});
         });
     },"firmware-inspect").start();
  }
