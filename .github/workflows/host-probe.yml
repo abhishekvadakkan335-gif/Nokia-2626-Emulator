@@ -30,10 +30,10 @@ jobs:
           cp -L "$UCLIB/libunicorn.so.2" host-out/libunicorn.so.2
           gcc -std=c11 -O2 -fPIC -shared -Wall -Wextra \
             -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
-            -Iapp/src/main/cpp/include app/src/main/cpp/native_bridge.c \
+            -Iapp/src/main/cpp/include app/src/main/cpp/native_bridge.c app/src/main/cpp/full_probe.c \
             -Lhost-out -Wl,-rpath,'$ORIGIN' -l:libunicorn.so.2 \
             -o host-out/libnokia_engine.so
-          javac -d host-out/classes tools/host/NativeEngine.java
+          javac -d host-out/classes tools/host/NativeEngine.java app/src/main/java/com/retro/n2626/Dct4Container.java
           java -Djava.library.path=host-out -cp host-out/classes com.retro.n2626.NativeEngine --self-test
       - uses: actions/upload-artifact@v4
         with:

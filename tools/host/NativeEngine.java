@@ -10,11 +10,19 @@ public final class NativeEngine {
     static { System.loadLibrary("nokia_engine"); }
     public static native String testCPU();
     public static native String traceFirmware(byte[] image, boolean fast);
+    public static native String traceFull(byte[] decoded, byte[] raw, boolean explore);
     public static void main(String[] args) throws Exception {
         if (args.length == 1 && args[0].equals("--self-test")) {
             String report = testCPU();
             System.out.println(report);
             if (report.contains("FAIL") || !report.contains("PASS")) System.exit(1);
+            return;
+        }
+        if (args.length==2 && (args[0].equals("--full")||args[0].equals("--full-strict"))) {
+            try(java.io.InputStream in=Files.newInputStream(Path.of(args[1]))){
+                Dct4Container.Full full=Dct4Container.fullZip(in);
+                System.out.println(traceFull(full.decoded,full.raw,args[0].equals("--full")));
+            }
             return;
         }
         if (args.length < 1 || args.length > 2) {
