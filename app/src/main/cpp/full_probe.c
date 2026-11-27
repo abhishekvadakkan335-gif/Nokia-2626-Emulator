@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 /* Android port of the local RM-291 06.81 exploratory probe.
  * Samsung model only. This is not a verified hardware implementation.
  * No firmware bundled. Flash mappings remain read-only.
